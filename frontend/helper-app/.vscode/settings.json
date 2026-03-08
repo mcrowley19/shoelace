@@ -1,0 +1,10 @@
+{
+  "java.import.exclusions": [
+    "**/android/**"
+  ],
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "explicit",
+    "source.organizeImports": "explicit",
+    "source.sortMembers": "explicit"
+  }
+}

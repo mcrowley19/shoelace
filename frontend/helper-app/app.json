@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "helper-app",
+    "slug": "helper-app",
+    "scheme": "helperapp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.INTERNET",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
+      "package": "com.helperapp"
+    },
+    "plugins": [
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Helper App needs camera access to provide AI guidance."
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Helper App needs microphone permission.",
+          "audioAndVideoOnlyPermission": true
+        }
+      ],
+      "expo-audio"
+    ],
+    "ios": {
+      "infoPlist": {
+        "NSCameraUsageDescription": "Helper App needs camera access to provide AI guidance."
+      },
+      "bundleIdentifier": "com.helperapp"
+    }
+  }
+}
