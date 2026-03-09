@@ -1,11 +1,14 @@
 import asyncio
-import struct
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai.types import LiveConnectConfig, Part, Content, AudioTranscriptionConfig
 import json
+import logging
 import base64
 import traceback
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 PROJECT_ID = "helper-489113"
 LOCATION = "us-central1"
@@ -22,7 +25,7 @@ Core guidelines:
 6. Speak simply and slowly as if to someone learning for the first time.
 7. Only give exact physical actions — "tap the button" not "open it".
 8. If a step is clearly wrong (not just unclear), say what went wrong and exactly how to fix it.
-9. When all steps are done, say "ALL DONE" and congratulate them warmly.
+9. When all steps are done, say "BEEP".
 """
 
 app = FastAPI()
@@ -30,45 +33,198 @@ client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 active_sessions: dict[str, asyncio.Task] = {}
 
 
-def build_wav(pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, bits: int = 16) -> bytes:
-    data_size = len(pcm_data)
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", data_size + 36, b"WAVE",
-        b"fmt ", 16, 1, channels, sample_rate,
-        sample_rate * channels * bits // 8,
-        channels * bits // 8, bits,
-        b"data", data_size,
-    )
-    return header + pcm_data
-
-
 def _transcription_says_complete(response) -> bool:
     """Safely check if any transcription on this response contains the completion phrase."""
-    try:
-        sc = response.server_content
-        if not sc:
-            return False
-        transcription = getattr(sc, "output_transcription", None)
-        if transcription:
-            text = getattr(transcription, "text", None)
-            print(text.upper())
-            if text and "ALL DONE" in text.upper():
+    sc = response.server_content
+    if sc and getattr(sc, "output_transcription", None):
+        transcription = sc.output_transcription
+        text = getattr(transcription, "text", None)
+        if text:
+            text_upper = text.upper()
+            print(f"ln44: transcription text: {text_upper}", flush=True)
+            if "BEEP" in text_upper:
+                print("ln46: BEEP detected, marking task complete", flush=True)
                 return True
-        # Some SDK versions surface transcription inside model_turn parts
-        model_turn = getattr(sc, "model_turn", None)
-        if model_turn:
-            for part in getattr(model_turn, "parts", []):
-                text = getattr(part, "text", None)
-                if text and "ALL DONE" in text.upper():
-                    return True
-    except Exception:
-        pass
     return False
 
 
+async def _send_ready_signal(websocket: WebSocket) -> None:
+    """Send a ready signal to the frontend to request the next frame."""
+    print("ln53: sending ready signal to frontend", flush=True)
+    try:
+        await websocket.send_json({"type": "ready"})
+    except Exception as e:
+        print(f"ln57: error sending ready signal: {e}", flush=True)
+
+
+async def _send_task_complete(websocket: WebSocket) -> None:
+    """Notify the frontend that the task is complete."""
+    print("ln62: sending TASK_COMPLETE to frontend", flush=True)
+    try:
+        await websocket.send_json({"type": "TASK_COMPLETE"})
+    except Exception as e:
+        print(f"ln66: error sending TASK_COMPLETE: {e}", flush=True)
+
+
+def _drain_frame_queue(frame_queue: asyncio.Queue) -> None:
+    """Remove all stale frames from the queue."""
+    drained = 0
+    while not frame_queue.empty():
+        try:
+            frame_queue.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+    if drained:
+        print(f"ln79: drained {drained} stale frame(s) from queue", flush=True)
+
+
+async def _frame_producer(websocket: WebSocket, frame_queue: asyncio.Queue, done: asyncio.Event) -> None:
+    """Reads frames from the WebSocket and puts the latest into the queue."""
+    print("ln84: frame producer started", flush=True)
+    frame_count = 0
+    try:
+        async for message in websocket.iter_text():
+            if done.is_set():
+                print("ln89: done event set, stopping frame producer", flush=True)
+                break
+            if frame_queue.full():
+                frame_queue.get_nowait()
+                print("ln93: dropped stale frame from full queue", flush=True)
+            await frame_queue.put(message)
+            frame_count += 1
+            print(f"ln96: frame {frame_count} queued (message len={len(message)})", flush=True)
+    except WebSocketDisconnect as e:
+        print(f"ln98: WebSocket disconnected in frame producer: {e}", flush=True)
+    except asyncio.CancelledError:
+        print(f"ln100: frame producer cancelled after {frame_count} frames", flush=True)
+        raise
+
+
+async def _process_gemini_response(
+    session,
+    websocket: WebSocket,
+    done: asyncio.Event
+) -> bool:
+    """Process Gemini response and send audio to frontend. Returns True if task is complete."""
+    MIN_PCM_BYTES = 12000  # 250ms at 24kHz 16-bit mono
+    pcm_buffer = bytearray()
+    transcription_complete = False
+    audio_chunks_sent = 0
+
+    print("ln115: waiting for Gemini response", flush=True)
+    try:
+        async with asyncio.timeout(15):
+            async for response in session.receive():
+                if response.data:
+                    pcm_buffer.extend(response.data)
+                    if len(pcm_buffer) >= MIN_PCM_BYTES:
+                        # Trim to 2-byte boundary for 16-bit sample alignment
+                        send_len = len(pcm_buffer) & ~1
+                        await websocket.send_bytes(bytes(pcm_buffer[:send_len]))
+                        del pcm_buffer[:send_len]
+                        audio_chunks_sent += 1
+                        print(f"ln127: sent audio chunk {audio_chunks_sent} ({send_len} bytes)", flush=True)
+
+                if _transcription_says_complete(response):
+                    transcription_complete = True
+
+                if response.server_content and response.server_content.turn_complete:
+                    print("ln133: Gemini turn complete", flush=True)
+                    break
+
+        if pcm_buffer:
+            send_len = len(pcm_buffer) & ~1
+            if send_len > 0:
+                await websocket.send_bytes(bytes(pcm_buffer[:send_len]))
+                print(f"ln140: flushed remaining {send_len} bytes of audio", flush=True)
+    except asyncio.TimeoutError:
+        print("ln142: Gemini response timed out after 15s", flush=True)
+    except WebSocketDisconnect:
+        raise
+
+    print(f"ln146: Gemini response processed, transcription_complete={transcription_complete}, audio_chunks_sent={audio_chunks_sent}", flush=True)
+    return transcription_complete
+
+
+async def _process_frame(
+    session,
+    websocket: WebSocket,
+    frame: str,
+    frame_queue: asyncio.Queue,
+    done: asyncio.Event
+) -> bool:
+    """Process a single camera frame. Returns True if task is complete."""
+    print(f"ln158: processing frame (base64 len={len(frame)})", flush=True)
+    try:
+        image_bytes = base64.b64decode(frame)
+        print(f"ln161: decoded frame to {len(image_bytes)} bytes", flush=True)
+    except Exception as e:
+        print(f"ln163: error decoding frame: {e}", flush=True)
+        return False
+
+    try:
+        print("ln167: sending frame to Gemini", flush=True)
+        await session.send_client_content(
+            turns=Content(
+                role="user",
+                parts=[Part.from_bytes(data=image_bytes, mime_type="image/jpeg")],
+            ),
+            turn_complete=True,
+        )
+
+        transcription_complete = await _process_gemini_response(session, websocket, done)
+
+        if transcription_complete:
+            print("ln179: task complete, setting done event", flush=True)
+            done.set()
+            await _send_task_complete(websocket)
+            return True
+
+        # Drain stale frames and request a fresh one
+        _drain_frame_queue(frame_queue)
+        if not done.is_set():
+            await _send_ready_signal(websocket)
+
+        return False
+    except Exception as e:
+        print(f"ln191: Gemini session error: {e}", flush=True)
+        logger.exception(f"Gemini session error: {e}")
+        done.set()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return False
+
+async def _process_loop(
+    session,
+    websocket: WebSocket,
+    frame_queue: asyncio.Queue,
+    done: asyncio.Event
+) -> None:
+    """Main processing loop: retrieves frames and sends them to Gemini."""
+    print("ln207: process loop started, sending initial ready signal", flush=True)
+    await _send_ready_signal(websocket)
+
+    frame_index = 0
+    while not done.is_set():
+        try:
+            frame = await asyncio.wait_for(frame_queue.get(), timeout=1.0)
+            frame_index += 1
+            print(f"ln215: got frame {frame_index} from queue", flush=True)
+        except asyncio.TimeoutError:
+            continue
+
+        task_complete = await _process_frame(session, websocket, frame, frame_queue, done)
+        if task_complete:
+            print(f"ln221: task complete after {frame_index} frames", flush=True)
+            return
+
 
 async def _run_session(websocket: WebSocket, task_prompt: str):
+    """Establish Gemini session and run the main processing loop."""
+    print(f"ln227: starting Gemini session, task_prompt length={len(task_prompt)}", flush=True)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(task_prompt=task_prompt)
 
     connect_cm = client.aio.live.connect(
@@ -79,127 +235,28 @@ async def _run_session(websocket: WebSocket, task_prompt: str):
             system_instruction=system_prompt,
         ),
     )
-
+    print("ln238: connecting to Gemini live API", flush=True)
     try:
-        session = await asyncio.wait_for(connect_cm.__aenter__(), timeout=30)
+        session = await asyncio.wait_for(connect_cm.__aenter__(), timeout=10)
+        print("ln241: Gemini session established", flush=True)
     except asyncio.TimeoutError:
-        print("Gemini Live API connection timed out after 30s")
-        try:
-            await websocket.send_json({"type": "error", "message": "Connection timeout"})
-        except Exception:
-            pass
-        return
-    except Exception as e:
-        print(f"Gemini Live API connection failed: {e}")
-        traceback.print_exc()
-        try:
-            await websocket.send_json({"type": "error", "message": "Connection failed"})
-        except Exception:
-            pass
+        print("ln243: timed out connecting to Gemini (10s)", flush=True)
         return
 
     try:
         frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         done = asyncio.Event()
 
-        async def frame_producer():
-            """Reads frames from the WebSocket and puts the latest into the queue."""
-            try:
-                async for message in websocket.iter_text():
-                    if done.is_set():
-                        break
-                    if frame_queue.full():
-                        frame_queue.get_nowait()
-                    await frame_queue.put(message)
-            except asyncio.CancelledError:
-                pass
-
-        async def process_loop():
-            """Sends frames to Gemini and relays responses back to the client."""
-            # Prompt the frontend for the first frame in case the initial capture
-            # in ws.onopen failed (e.g. camera not yet ready when the socket opened).
-            try:
-                await websocket.send_json({"type": "ready"})
-            except Exception:
-                pass
-
-            while not done.is_set():
-                try:
-                    frame = await asyncio.wait_for(frame_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-
-                image_bytes = base64.b64decode(frame)
-                transcription_complete = False
-                try:
-                    # google-genai SDK API varies by version: some require await,
-                    # others changed send_client_content to an async context manager.
-                    _send = session.send_client_content(
-                        turns=Content(
-                            role="user",
-                            parts=[Part.from_bytes(data=image_bytes, mime_type="image/jpeg")],
-                        ),
-                        turn_complete=True,
-                    )
-                    if hasattr(_send, '__aenter__'):
-                        async with _send:
-                            pass
-                    else:
-                        await _send
-
-                    try:
-                        async with asyncio.timeout(15):
-                            async for response in session.receive():
-                                if response.data:
-                                    await websocket.send_bytes(build_wav(bytes(response.data)))
-                                if _transcription_says_complete(response):
-                                    transcription_complete = True
-                                if response.server_content and response.server_content.turn_complete:
-                                    break
-                    except asyncio.TimeoutError:
-                        print("Gemini did not respond within 15s, continuing")
-                except Exception as e:
-                    print(f"Gemini session error: {e}")
-                    traceback.print_exc()
-                    done.set()
-                    try:
-                        await websocket.send_json({"type": "error", "message": "Session error"})
-                    except Exception:
-                        pass
-                    break
-
-                if transcription_complete:
-                    done.set()
-                    try:
-                        await websocket.send_json({"type": "TASK_COMPLETE"})
-                    except Exception as e:
-                        print(f"Error sending TASK_COMPLETE: {e}")
-                    return
-
-                # Drain all stale frames — the "ready" signal will prompt the
-                # frontend to send a fresh one.
-                while not frame_queue.empty():
-                    try:
-                        frame_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                # Signal the frontend to send a fresh frame.
-                # The loop will then block at frame_queue.get() until it arrives.
-                if not done.is_set():
-                    try:
-                        await websocket.send_json({"type": "ready"})
-                    except Exception:
-                        pass
-
-        producer_task = asyncio.create_task(frame_producer())
-        processor_task = asyncio.create_task(process_loop())
+        print("ln250: creating producer and processor tasks", flush=True)
+        producer_task = asyncio.create_task(_frame_producer(websocket, frame_queue, done))
+        processor_task = asyncio.create_task(_process_loop(session, websocket, frame_queue, done))
 
         try:
             _, pending = await asyncio.wait(
                 [producer_task, processor_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            print(f"ln259: one task finished, cancelling {len(pending)} pending task(s)", flush=True)
             for task in pending:
                 task.cancel()
                 try:
@@ -207,6 +264,7 @@ async def _run_session(websocket: WebSocket, task_prompt: str):
                 except (asyncio.CancelledError, Exception):
                     pass
         except asyncio.CancelledError:
+            print("ln267: session cancelled, cleaning up tasks", flush=True)
             done.set()
             for task in [producer_task, processor_task]:
                 task.cancel()
@@ -216,49 +274,71 @@ async def _run_session(websocket: WebSocket, task_prompt: str):
                     pass
             raise
     finally:
+        print("ln277: closing Gemini session", flush=True)
         try:
             await connect_cm.__aexit__(None, None, None)
         except Exception:
             pass
 
 
-@app.websocket("/live/{user_id}")
-async def live_ws(websocket: WebSocket, user_id: str):
-    await websocket.accept()
-
-    # Cancel any existing session for this user
+async def _cancel_existing_session(user_id: str) -> None:
+    """Cancel any existing session for the given user."""
     existing = active_sessions.get(user_id)
     if existing and not existing.done():
-        print(f"Cancelling existing session for user {user_id}")
+        print(f"ln288: cancelling existing session for user {user_id}", flush=True)
         existing.cancel()
         try:
             await existing
         except (asyncio.CancelledError, Exception):
             pass
 
+
+async def _handle_session_startup(websocket: WebSocket) -> str | None:
+    """Handle the initial message to extract the task prompt. Returns task_prompt or None."""
+    print("ln298: waiting for initial task message", flush=True)
     try:
         first_message = await websocket.receive_text()
+        print(f"ln301: received first message: {first_message}", flush=True)
         data = json.loads(first_message)
 
         if data.get("type") != "task":
+            print(f"ln305: unexpected message type: {data.get('type')}, closing", flush=True)
             await websocket.close()
-            return
+            return None
 
         task_prompt = data.get("task", data.get("prompt", ""))
+        print(f"ln310: extracted task prompt (len={len(task_prompt)})", flush=True)
+        return task_prompt
+    except (WebSocketDisconnect, json.JSONDecodeError) as e:
+        logger.warning(f"Error during session startup: {e}")
+        return None
 
+
+@app.websocket("/live/{user_id}")
+async def live_ws(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    print(f"ln320: WebSocket connected for user {user_id}", flush=True)
+    await _cancel_existing_session(user_id)
+
+    try:
+        task_prompt = await _handle_session_startup(websocket)
+        if not task_prompt:
+            print(f"ln326: no task prompt received, closing session for user {user_id}", flush=True)
+            return
+        print(f"ln328: task prompt received, starting session for user {user_id}", flush=True)
         session_task = asyncio.create_task(_run_session(websocket, task_prompt))
         active_sessions[user_id] = session_task
 
         try:
             await session_task
         except asyncio.CancelledError:
-            pass
+            print(f"ln335: session cancelled for user {user_id}", flush=True)
         except Exception as e:
-            print(f"Session error for user {user_id}: {e}")
+            print(f"ln337: session error for user {user_id}: {e}", flush=True)
             traceback.print_exc()
 
     except WebSocketDisconnect:
-        print(f"User {user_id} disconnected")
+        print(f"ln341: user {user_id} disconnected during startup", flush=True)
     finally:
         active_sessions.pop(user_id, None)
-        print(f"WebSocket for user {user_id} closed")
+        print(f"ln344: WebSocket for user {user_id} closed", flush=True)

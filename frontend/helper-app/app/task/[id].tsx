@@ -21,7 +21,38 @@ import CompletionOverlay from "@/components/CompletionOverlay";
 
 const WS_URL = "REDACTED";
 
-const INSTRUCTION_COOLDOWN_MS = 200;
+/** Build a WAV file header + PCM body in JS, so the backend can send raw PCM. */
+function buildWav(
+  pcm: Uint8Array,
+  sampleRate = 24000,
+  channels = 1,
+  bits = 16,
+): Uint8Array {
+  const dataSize = pcm.length;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const v = new DataView(buf);
+  const str = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  str(0, "RIFF");
+  v.setUint32(4, dataSize + 36, true);
+  str(8, "WAVE");
+  str(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); // PCM
+  v.setUint16(22, channels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, (sampleRate * channels * bits) / 8, true);
+  v.setUint16(32, (channels * bits) / 8, true);
+  v.setUint16(34, bits, true);
+  str(36, "data");
+  v.setUint32(40, dataSize, true);
+  new Uint8Array(buf, 44).set(pcm);
+  return new Uint8Array(buf);
+}
+
+const MAX_RECONNECT_ATTEMPTS = 8;
+const RECONNECT_BASE_DELAY_MS = 1000;
 
 export default function TaskDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -34,18 +65,16 @@ export default function TaskDetailScreen() {
   const device = useCameraDevice(facing);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const imageIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const audioPlayerRef = useRef<any>(null);
   const doneRef = useRef(false);
 
-  const audioQueueRef = useRef<string[]>([]);
+  const audioQueueRef = useRef<any[]>([]);
   const isPlayingRef = useRef(false);
   const audioChunkIndexRef = useRef(0);
   const audioIncomingRef = useRef(false);
-  // Set when TASK_COMPLETE is received — lets current audio finish before completing.
+  const pcmAccumulatorRef = useRef<Uint8Array[]>([]);
   const completionPendingRef = useRef(false);
-  // Holds the latest complete() function so playNext can call it.
   const completeRef = useRef<() => void>(() => {});
 
   const [isLoading, setIsLoading] = useState(false);
@@ -56,20 +85,19 @@ export default function TaskDetailScreen() {
   const overlayOpacity = useRef(new Animated.Value(0)).current;
   const tickScale = useRef(new Animated.Value(0.4)).current;
 
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const s = makeStyles();
   const userId = useRef<string>("");
 
-  /**
-   * Sequentially play audio chunks to prevent overlapping speech.
-   * The interval (or "ready" signal) drives the next image capture.
-   */
-  const scheduleNextFrame = useCallback((delayMs = 100) => {
+  const scheduleNextFrame = useCallback(() => {
     if (doneRef.current || completionPendingRef.current) return;
     if (readyTimeoutRef.current) clearTimeout(readyTimeoutRef.current);
     readyTimeoutRef.current = setTimeout(() => {
       readyTimeoutRef.current = null;
       captureAndSendImage();
-    }, delayMs);
+    }, 1500);
   }, []);
 
   const playNext = () => {
@@ -77,27 +105,26 @@ export default function TaskDetailScreen() {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
 
     isPlayingRef.current = true;
-    const uri = audioQueueRef.current.shift()!;
+    const player = audioQueueRef.current.shift()!;
 
     audioPlayerRef.current?.remove();
-    const player = createAudioPlayer({ uri });
     audioPlayerRef.current = player;
 
+    let wasLoaded = false;
     const subscription = player.addListener(
       "playbackStatusUpdate",
       (status: any) => {
-        if (status.didJustFinish || status.isLoaded === false) {
+        if (status.isLoaded) wasLoaded = true;
+        if (status.didJustFinish || (status.isLoaded === false && wasLoaded)) {
           subscription?.remove();
           isPlayingRef.current = false;
           if (audioQueueRef.current.length > 0) {
             playNext();
           } else if (completionPendingRef.current) {
-            // All congratulatory audio has played — now complete.
             completionPendingRef.current = false;
             completeRef.current();
           } else {
-            // All audio finished — wait before capturing so the user has time to act
-            scheduleNextFrame(1500);
+            scheduleNextFrame();
           }
         }
       },
@@ -106,16 +133,41 @@ export default function TaskDetailScreen() {
     player.play();
   };
 
-  const enqueueAudio = async (chunk: ArrayBuffer) => {
+  const accumulatePcm = (chunk: ArrayBuffer) => {
+    if (!firstAudioRef.current) {
+      firstAudioRef.current = true;
+      setIsLoading(false);
+    }
+    pcmAccumulatorRef.current.push(new Uint8Array(chunk));
+    audioIncomingRef.current = true;
+  };
+
+  const flushPcmBuffer = async () => {
+    const chunks = pcmAccumulatorRef.current;
+    pcmAccumulatorRef.current = [];
+    audioIncomingRef.current = false;
+
+    if (chunks.length === 0) return;
+
+    // Concatenate chunks and enforce 2-byte alignment for 16-bit samples.
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const alignedLen = totalLen & ~1;
+    if (alignedLen === 0) return;
+
+    const pcm = new Uint8Array(alignedLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      const copyLen = Math.min(chunk.length, alignedLen - offset);
+      pcm.set(chunk.subarray(0, copyLen), offset);
+      offset += copyLen;
+      if (offset >= alignedLen) break;
+    }
+
     try {
-      if (!firstAudioRef.current) {
-        firstAudioRef.current = true;
-        setIsLoading(false);
-      }
-      const bytes = new Uint8Array(chunk);
+      const wav = buildWav(pcm);
       let binary = "";
-      for (let i = 0; i < bytes.length; i += 8192) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      for (let i = 0; i < wav.length; i += 8192) {
+        binary += String.fromCharCode(...wav.subarray(i, i + 8192));
       }
       const base64 = btoa(binary);
       const uri =
@@ -123,17 +175,14 @@ export default function TaskDetailScreen() {
       await FileSystem.writeAsStringAsync(uri, base64, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      audioQueueRef.current.push(uri);
-      // Audio is now safely in the queue — lift the incoming guard
-      audioIncomingRef.current = false;
-      // Cancel any pending frame capture — audio completion will reschedule it
+      audioQueueRef.current.push(createAudioPlayer({ uri }));
       if (readyTimeoutRef.current) {
         clearTimeout(readyTimeoutRef.current);
         readyTimeoutRef.current = null;
       }
       playNext();
     } catch (err) {
-      console.warn("Error enqueuing AI audio:", err);
+      console.warn("Error flushing PCM buffer:", err);
     }
   };
 
@@ -159,6 +208,7 @@ export default function TaskDetailScreen() {
 
       doneRef.current = false;
       completionPendingRef.current = false;
+      reconnectAttemptsRef.current = 0;
 
       // Reset audio queue state on new session
       audioQueueRef.current = [];
@@ -171,10 +221,6 @@ export default function TaskDetailScreen() {
       setAudioModeAsync({ playsInSilentMode: true });
 
       const stopImages = () => {
-        if (imageIntervalRef.current) {
-          clearInterval(imageIntervalRef.current);
-          imageIntervalRef.current = null;
-        }
         if (readyTimeoutRef.current) {
           clearTimeout(readyTimeoutRef.current);
           readyTimeoutRef.current = null;
@@ -186,6 +232,9 @@ export default function TaskDetailScreen() {
       };
 
       const stopAudio = () => {
+        pcmAccumulatorRef.current = [];
+        audioIncomingRef.current = false;
+        audioQueueRef.current.forEach((p: any) => p.remove());
         audioQueueRef.current = [];
         isPlayingRef.current = false;
         audioPlayerRef.current?.pause();
@@ -224,111 +273,151 @@ export default function TaskDetailScreen() {
       // Keep ref up to date so playNext can call it after audio finishes.
       completeRef.current = complete;
 
-      userId.current = uuidv4();
-      const ws = new WebSocket(`${WS_URL}/${userId.current}`);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
+      const scheduleReconnect = () => {
+        if (doneRef.current) return;
 
-      ws.onopen = () => {
-        console.log("WebSocket connected");
-        ws.send(JSON.stringify({ type: "task", task: task.prompt }));
-        captureAndSendImage();
-        // If no audio arrives within 45s something has gone wrong (e.g. the
-        // Gemini connection timed out on the backend). Close and show an error.
-        loadingTimeoutRef.current = setTimeout(() => {
-          loadingTimeoutRef.current = null;
-          if (!firstAudioRef.current && !doneRef.current) {
-            console.warn("No AI response within 45s — aborting");
-            doneRef.current = true;
-            if (ws.readyState !== WebSocket.CLOSED) ws.close();
+        if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+          // Exhausted all retries
+          if (firstAudioRef.current) {
+            // Session was active — treat as complete rather than error
+            complete();
+          } else {
             setIsLoading(false);
             setConnectionError(true);
           }
-        }, 45000);
+          return;
+        }
+
+        const attempt = reconnectAttemptsRef.current;
+        reconnectAttemptsRef.current += 1;
+        const delay = Math.min(
+          RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt),
+          30000,
+        );
+
+        // Restore loading spinner if audio had already started
+        setIsLoading(true);
+        console.log(
+          `Reconnecting in ${delay}ms (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS})`,
+        );
+
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          if (!doneRef.current) connect();
+        }, delay);
       };
 
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          try {
-            const msg = JSON.parse(event.data);
+      const connect = () => {
+        userId.current = uuidv4();
+        const ws = new WebSocket(`${WS_URL}/${userId.current}`);
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
 
-            if (msg.type === "error") {
-              console.warn("Backend error:", msg.message);
-              if (!doneRef.current) {
-                doneRef.current = true;
+        ws.onopen = () => {
+          console.log("WebSocket connected");
+          ws.send(JSON.stringify({ type: "task", task: task.prompt }));
+
+          if (
+            !isPlayingRef.current &&
+            audioQueueRef.current.length === 0 &&
+            !audioIncomingRef.current
+          ) {
+            captureAndSendImage();
+          }
+
+          if (loadingTimeoutRef.current)
+            clearTimeout(loadingTimeoutRef.current);
+          loadingTimeoutRef.current = setTimeout(() => {
+            loadingTimeoutRef.current = null;
+            if (!firstAudioRef.current && !doneRef.current) {
+              console.warn("No AI response within 45s — reconnecting");
+              ws.close();
+            }
+          }, 45000);
+        };
+
+        ws.onmessage = async (event) => {
+          if (ws !== wsRef.current) return;
+
+          if (typeof event.data === "string") {
+            try {
+              const msg = JSON.parse(event.data);
+
+              if (msg.type === "error") {
+                console.warn("Backend error:", msg.message, "— reconnecting");
                 stopImages();
-                setIsLoading(false);
-                setConnectionError(true);
+                ws.close();
+                return;
               }
-              return;
-            }
 
-            if (msg.type === "ready") {
-              // Only schedule a frame if no audio is playing or incoming — otherwise
-              // audio completion will trigger the next capture via scheduleNextFrame.
-              if (!isPlayingRef.current && audioQueueRef.current.length === 0 && !audioIncomingRef.current) {
-                if (readyTimeoutRef.current)
-                  clearTimeout(readyTimeoutRef.current);
-                readyTimeoutRef.current = setTimeout(() => {
-                  readyTimeoutRef.current = null;
-                  captureAndSendImage();
-                }, INSTRUCTION_COOLDOWN_MS);
+              if (msg.type === "ready") {
+                await flushPcmBuffer();
+                if (
+                  !isPlayingRef.current &&
+                  audioQueueRef.current.length === 0
+                ) {
+                  if (readyTimeoutRef.current)
+                    clearTimeout(readyTimeoutRef.current);
+                  readyTimeoutRef.current = setTimeout(() => {
+                    readyTimeoutRef.current = null;
+                    captureAndSendImage();
+                  }, 0);
+                }
+                return;
               }
-              return;
-            }
 
-            if (msg.type === "TASK_COMPLETE") {
-              // Stop new frame captures immediately.
-              completionPendingRef.current = true;
-              stopImages();
-              // Let congratulatory audio finish before completing.
-              // If there is no audio in flight, complete right away.
-              if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
-                completionPendingRef.current = false;
-                complete();
+              if (msg.type === "TASK_COMPLETE") {
+                completionPendingRef.current = true;
+                stopImages();
+                await flushPcmBuffer();
+                if (
+                  !isPlayingRef.current &&
+                  audioQueueRef.current.length === 0
+                ) {
+                  completionPendingRef.current = false;
+                  complete();
+                }
               }
-            }
-          } catch {}
-        } else if (event.data instanceof ArrayBuffer) {
-          audioIncomingRef.current = true;
-          enqueueAudio(event.data);
-        }
-      };
+            } catch {}
+          } else if (event.data instanceof ArrayBuffer) {
+            accumulatePcm(event.data);
+          }
+        };
 
-      ws.onerror = () => {
-        if (ws.readyState !== WebSocket.CLOSED && !doneRef.current) {
-          console.warn("WebSocket error");
-        }
-      };
+        ws.onerror = () => {
+          if (ws.readyState !== WebSocket.CLOSED && !doneRef.current) {
+            console.warn("WebSocket error");
+          }
+        };
 
-      ws.onclose = () => {
-        console.log("WebSocket disconnected");
-        // Fallback: if the TASK_COMPLETE message was received before onclose,
-        // doneRef is already true and complete() is a no-op. If onclose fires
-        // first (race condition on mobile) or the message was dropped, this
-        // ensures completion still fires. Guard on firstAudioRef so a failed
-        // connection before the AI responds doesn't falsely complete the task.
-        // Skip if completionPendingRef is set — playNext will call complete()
-        // once the audio queue drains.
-        if (!completionPendingRef.current && firstAudioRef.current) {
-          complete();
-        } else if (!firstAudioRef.current && !doneRef.current) {
-          // Connection closed before any AI response — show error instead of
-          // leaving the user stuck on the loading spinner.
-          doneRef.current = true;
+        ws.onclose = () => {
+          if (ws !== wsRef.current) return;
+
+          console.log("WebSocket disconnected");
+
+          if (doneRef.current) return;
+
+          if (completionPendingRef.current) return;
           stopImages();
-          setIsLoading(false);
-          setConnectionError(true);
-        }
+          scheduleReconnect();
+        };
       };
+
+      connect();
 
       return () => {
         doneRef.current = true;
         completionPendingRef.current = false;
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
         stopImages(); // also clears loadingTimeoutRef
         stopAudio();
         setIsLoading(false);
-        if (ws.readyState !== WebSocket.CLOSED) ws.close();
+        // Close the current socket (wsRef.current, not the originally captured ws)
+        const current = wsRef.current;
+        if (current && current.readyState !== WebSocket.CLOSED) current.close();
       };
     }, [hasPermission, task?.id, task?.text]),
   );
@@ -397,7 +486,12 @@ export default function TaskDetailScreen() {
       {connectionError && (
         <View style={loadingStyles.overlay}>
           <View style={loadingStyles.card}>
-            <Text style={[loadingStyles.text, { color: "#DC2626", marginBottom: 16 }]}>
+            <Text
+              style={[
+                loadingStyles.text,
+                { color: "#DC2626", marginBottom: 16 },
+              ]}
+            >
               Could not connect to AI. Please try again.
             </Text>
             <TouchableOpacity onPress={() => router.back()}>
