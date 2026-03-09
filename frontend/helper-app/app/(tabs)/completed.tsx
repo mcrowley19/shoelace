@@ -27,7 +27,7 @@ export default function CompletedScreen() {
       <View style={s.header}>
         <Text style={s.title}>Completed</Text>
         <Text style={s.subtitle}>
-          {completed.length} task{completed.length !== 1 ? "s" : ""} done
+          {completed.length} Skill{completed.length !== 1 ? "s" : ""} done
         </Text>
       </View>
 
@@ -36,7 +36,7 @@ export default function CompletedScreen() {
           <Text style={s.emptyIcon}>○</Text>
           <Text style={s.emptyTitle}>Nothing completed yet</Text>
           <Text style={s.emptySubtitle}>
-            Tasks you finish will appear here.
+            Skills you learn will appear here.
           </Text>
         </View>
       ) : (

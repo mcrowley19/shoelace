@@ -62,7 +62,8 @@ function getDateLine(): string {
 
 const TASK_IMAGES: Record<string, any> = {
   "Make toast": require("@/assets/images/toast.png"),
-  "Fold clothes": require("@/assets/images/fold_clothes.png"),
+  "Fold a shirt": require("@/assets/images/fold_clothes.png"),
+  "Fold trousers": require("@/assets/images/fold_clothes.png"),
   "Tie shoelaces": require("@/assets/images/tie_shoes.png"),
 };
 
