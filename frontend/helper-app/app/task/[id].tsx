@@ -9,8 +9,13 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { router, useLocalSearchParams, useFocusEffect } from "expo-router";
 import * as FileSystem from "expo-file-system";
-import { createAudioPlayer, setAudioModeAsync } from "expo-audio";
+import {
+  AudioContext,
+  AudioBufferQueueSourceNode,
+} from "react-native-audio-api";
+import { fromByteArray } from "react-native-quick-base64";
 import { useTasks } from "@/context/tasks-context";
+import { useSettings } from "@/context/settings-context";
 import { makeStyles, loadingStyles } from "@/styles/task";
 import { v4 as uuidv4 } from "uuid";
 import "react-native-get-random-values";
@@ -21,42 +26,13 @@ import CompletionOverlay from "@/components/CompletionOverlay";
 
 const WS_URL = "wss://task-agent-746295074769.europe-west1.run.app/live";
 
-/** Build a WAV file header + PCM body in JS, so the backend can send raw PCM. */
-function buildWav(
-  pcm: Uint8Array,
-  sampleRate = 24000,
-  channels = 1,
-  bits = 16,
-): Uint8Array {
-  const dataSize = pcm.length;
-  const buf = new ArrayBuffer(44 + dataSize);
-  const v = new DataView(buf);
-  const str = (off: number, s: string) => {
-    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
-  };
-  str(0, "RIFF");
-  v.setUint32(4, dataSize + 36, true);
-  str(8, "WAVE");
-  str(12, "fmt ");
-  v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true); // PCM
-  v.setUint16(22, channels, true);
-  v.setUint32(24, sampleRate, true);
-  v.setUint32(28, (sampleRate * channels * bits) / 8, true);
-  v.setUint16(32, (channels * bits) / 8, true);
-  v.setUint16(34, bits, true);
-  str(36, "data");
-  v.setUint32(40, dataSize, true);
-  new Uint8Array(buf, 44).set(pcm);
-  return new Uint8Array(buf);
-}
-
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1000;
 
 export default function TaskDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { getTask, toggleTask } = useTasks();
+  const { soundEffects, transcriptions } = useSettings();
   const task = getTask(id);
 
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -66,14 +42,19 @@ export default function TaskDetailScreen() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const audioPlayerRef = useRef<any>(null);
   const doneRef = useRef(false);
 
-  const audioQueueRef = useRef<any[]>([]);
-  const isPlayingRef = useRef(false);
-  const audioChunkIndexRef = useRef(0);
+  // Audio: Web Audio API streaming via native queue source node
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const queueNodeRef = useRef<AudioBufferQueueSourceNode | null>(null);
+  // Bytes written to native queue since last "ready" signal — used for duration estimation
+  const pendingAudioBytesRef = useRef(0);
+  // Timer that fires when estimated playback of queued audio is done
+  const audioPlaybackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
   const audioIncomingRef = useRef(false);
-  const pcmAccumulatorRef = useRef<Uint8Array[]>([]);
   const completionPendingRef = useRef(false);
   const completeRef = useRef<() => void>(() => {});
 
@@ -88,6 +69,11 @@ export default function TaskDetailScreen() {
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const [captionText, setCaptionText] = useState("");
+  const captionResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingWordsRef = useRef<string[]>([]);
+  const wordRevealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const s = makeStyles();
   const userId = useRef<string>("");
 
@@ -97,94 +83,113 @@ export default function TaskDetailScreen() {
     readyTimeoutRef.current = setTimeout(() => {
       readyTimeoutRef.current = null;
       captureAndSendImage();
-    }, 1500);
+    }, 300);
   }, []);
 
-  const playNext = () => {
-    if (doneRef.current) return;
-    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
-
-    isPlayingRef.current = true;
-    const player = audioQueueRef.current.shift()!;
-
-    audioPlayerRef.current?.remove();
-    audioPlayerRef.current = player;
-
-    let wasLoaded = false;
-    const subscription = player.addListener(
-      "playbackStatusUpdate",
-      (status: any) => {
-        if (status.isLoaded) wasLoaded = true;
-        if (status.didJustFinish || (status.isLoaded === false && wasLoaded)) {
-          subscription?.remove();
-          isPlayingRef.current = false;
-          if (audioQueueRef.current.length > 0) {
-            playNext();
-          } else if (completionPendingRef.current) {
-            completionPendingRef.current = false;
-            completeRef.current();
-          } else {
-            scheduleNextFrame();
-          }
-        }
-      },
-    );
-
-    player.play();
-  };
-
-  const accumulatePcm = (chunk: ArrayBuffer) => {
-    if (!firstAudioRef.current) {
-      firstAudioRef.current = true;
-      setIsLoading(false);
-    }
-    pcmAccumulatorRef.current.push(new Uint8Array(chunk));
-    audioIncomingRef.current = true;
-  };
-
-  const flushPcmBuffer = async () => {
-    const chunks = pcmAccumulatorRef.current;
-    pcmAccumulatorRef.current = [];
+  /**
+   * Called when all queued audio has drained (either via onBufferEnded or
+   * a duration-based timer). Triggers next frame capture or task completion.
+   */
+  const onAudioDrained = useCallback(() => {
+    pendingAudioBytesRef.current = 0;
     audioIncomingRef.current = false;
 
-    if (chunks.length === 0) return;
-
-    // Concatenate chunks and enforce 2-byte alignment for 16-bit samples.
-    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-    const alignedLen = totalLen & ~1;
-    if (alignedLen === 0) return;
-
-    const pcm = new Uint8Array(alignedLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      const copyLen = Math.min(chunk.length, alignedLen - offset);
-      pcm.set(chunk.subarray(0, copyLen), offset);
-      offset += copyLen;
-      if (offset >= alignedLen) break;
+    if (completionPendingRef.current) {
+      completionPendingRef.current = false;
+      completeRef.current();
+    } else {
+      scheduleNextFrame();
     }
+  }, [scheduleNextFrame]);
 
-    try {
-      const wav = buildWav(pcm);
-      let binary = "";
-      for (let i = 0; i < wav.length; i += 8192) {
-        binary += String.fromCharCode(...wav.subarray(i, i + 8192));
+  /**
+   * Initialise AudioContext + AudioBufferQueueSourceNode for this session.
+   * Safe to call multiple times — no-ops if already initialised.
+   */
+  const initAudio = useCallback(() => {
+    if (audioContextRef.current) return;
+
+    // 24 kHz matches the incoming PCM sample rate exactly.
+    const ctx = new AudioContext({ sampleRate: 24000 });
+    audioContextRef.current = ctx;
+
+    const node = ctx.createBufferQueueSource();
+    node.connect(ctx.destination);
+    node.start(0);
+
+    // Fires when the last enqueued buffer finishes playing.
+    node.onEnded = () => {
+      if (audioPlaybackTimerRef.current) {
+        clearTimeout(audioPlaybackTimerRef.current);
+        audioPlaybackTimerRef.current = null;
       }
-      const base64 = btoa(binary);
-      const uri =
-        FileSystem.cacheDirectory + `audio_${audioChunkIndexRef.current++}.wav`;
-      await FileSystem.writeAsStringAsync(uri, base64, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      audioQueueRef.current.push(createAudioPlayer({ uri }));
-      if (readyTimeoutRef.current) {
-        clearTimeout(readyTimeoutRef.current);
-        readyTimeoutRef.current = null;
+      onAudioDrained();
+    };
+
+    queueNodeRef.current = node;
+  }, [onAudioDrained]);
+
+  /**
+   * Receives a raw PCM ArrayBuffer from the WebSocket, 2-byte aligns it,
+   * fast-encodes it to base64 via native C++, and enqueues it directly on
+   * the native audio buffer — no filesystem, no WAV header, no JS loop.
+   */
+  const accumulatePcm = useCallback(
+    (chunk: ArrayBuffer) => {
+      if (!firstAudioRef.current) {
+        firstAudioRef.current = true;
+        setIsLoading(false);
+        initAudio(); // ensure context exists before first write
       }
-      playNext();
-    } catch (err) {
-      console.warn("Error flushing PCM buffer:", err);
-    }
-  };
+      audioIncomingRef.current = true;
+
+      // 2-byte align for 16-bit samples
+      const raw = new Uint8Array(chunk);
+      const alignedLen = raw.length & ~1;
+      if (alignedLen === 0) return;
+
+      const aligned =
+        alignedLen === raw.length ? raw : raw.subarray(0, alignedLen);
+
+      // C++ base64 — replaces the slow String.fromCharCode loop
+      const base64 = fromByteArray(aligned);
+
+      // Enqueue onto the native audio ring buffer
+      const ctx = audioContextRef.current;
+      const node = queueNodeRef.current;
+      if (!ctx || !node) return;
+
+      ctx
+        .decodePCMInBase64(base64, 24000, 1, true)
+        .then((audioBuffer) => {
+          if (doneRef.current || !queueNodeRef.current) return;
+          queueNodeRef.current.enqueueBuffer(audioBuffer);
+        })
+        .catch((err) => console.warn("decodePCMInBase64 error:", err));
+
+      pendingAudioBytesRef.current += alignedLen;
+    },
+    [initAudio],
+  );
+
+  /**
+   * Called on "ready" signal. Sets a timer for the estimated remaining playback
+   * duration, after which onAudioDrained fires (unless onended beats it).
+   */
+  const scheduleAfterAudio = useCallback(() => {
+    const durationMs =
+      (pendingAudioBytesRef.current / (24000 * 1 * 2)) * 1000;
+    pendingAudioBytesRef.current = 0;
+    audioIncomingRef.current = false;
+
+    if (audioPlaybackTimerRef.current)
+      clearTimeout(audioPlaybackTimerRef.current);
+
+    audioPlaybackTimerRef.current = setTimeout(() => {
+      audioPlaybackTimerRef.current = null;
+      onAudioDrained();
+    }, durationMs + 50); // 50 ms buffer for native drain jitter
+  }, [onAudioDrained]);
 
   const captureAndSendImage = async () => {
     const ws = wsRef.current;
@@ -210,15 +215,12 @@ export default function TaskDetailScreen() {
       completionPendingRef.current = false;
       reconnectAttemptsRef.current = 0;
 
-      // Reset audio queue state on new session
-      audioQueueRef.current = [];
-      isPlayingRef.current = false;
+      // Reset audio state for new session
+      pendingAudioBytesRef.current = 0;
       firstAudioRef.current = false;
-      audioChunkIndexRef.current = 0;
       audioIncomingRef.current = false;
       setIsLoading(true);
       setConnectionError(false);
-      setAudioModeAsync({ playsInSilentMode: true });
 
       const stopImages = () => {
         if (readyTimeoutRef.current) {
@@ -229,17 +231,69 @@ export default function TaskDetailScreen() {
           clearTimeout(loadingTimeoutRef.current);
           loadingTimeoutRef.current = null;
         }
+        if (captionResetTimerRef.current) {
+          clearTimeout(captionResetTimerRef.current);
+          captionResetTimerRef.current = null;
+        }
+        if (wordRevealTimerRef.current) {
+          clearInterval(wordRevealTimerRef.current);
+          wordRevealTimerRef.current = null;
+        }
+        pendingWordsRef.current = [];
+        setCaptionText("");
+      };
+
+      const appendCaption = (text: string) => {
+        const newWords = text.trim().split(/\s+/).filter(Boolean);
+        pendingWordsRef.current.push(...newWords);
+
+        if (captionResetTimerRef.current) {
+          clearTimeout(captionResetTimerRef.current);
+          captionResetTimerRef.current = null;
+        }
+
+        if (!wordRevealTimerRef.current) {
+          wordRevealTimerRef.current = setInterval(() => {
+            if (pendingWordsRef.current.length === 0) {
+              clearInterval(wordRevealTimerRef.current!);
+              wordRevealTimerRef.current = null;
+              captionResetTimerRef.current = setTimeout(() => {
+                captionResetTimerRef.current = null;
+                setCaptionText("");
+              }, 8000);
+              return;
+            }
+            const batch = pendingWordsRef.current.splice(0, 3);
+            setCaptionText((prev) => (prev ? prev + " " + batch.join(" ") : batch.join(" ")));
+          }, 350);
+        }
       };
 
       const stopAudio = () => {
-        pcmAccumulatorRef.current = [];
         audioIncomingRef.current = false;
-        audioQueueRef.current.forEach((p: any) => p.remove());
-        audioQueueRef.current = [];
-        isPlayingRef.current = false;
-        audioPlayerRef.current?.pause();
-        audioPlayerRef.current?.remove();
-        audioPlayerRef.current = null;
+        pendingAudioBytesRef.current = 0;
+
+        if (audioPlaybackTimerRef.current) {
+          clearTimeout(audioPlaybackTimerRef.current);
+          audioPlaybackTimerRef.current = null;
+        }
+
+        const node = queueNodeRef.current;
+        if (node) {
+          node.onEnded = null;
+          try {
+            node.stop(0);
+          } catch {}
+          queueNodeRef.current = null;
+        }
+
+        const ctx = audioContextRef.current;
+        if (ctx) {
+          try {
+            ctx.close();
+          } catch {}
+          audioContextRef.current = null;
+        }
       };
 
       const complete = () => {
@@ -250,7 +304,7 @@ export default function TaskDetailScreen() {
         const w = wsRef.current;
         if (w && w.readyState !== WebSocket.CLOSED) w.close();
         setShowCompletion(true);
-        playDing();
+        if (soundEffects) playDing();
         Animated.parallel([
           Animated.timing(overlayOpacity, {
             toValue: 1,
@@ -270,7 +324,7 @@ export default function TaskDetailScreen() {
         }, 1800);
       };
 
-      // Keep ref up to date so playNext can call it after audio finishes.
+      // Keep ref up to date so onAudioDrained can call it after audio finishes.
       completeRef.current = complete;
 
       const scheduleReconnect = () => {
@@ -308,6 +362,7 @@ export default function TaskDetailScreen() {
       };
 
       const connect = () => {
+        firstAudioRef.current = false;
         userId.current = uuidv4();
         const ws = new WebSocket(`${WS_URL}/${userId.current}`);
         ws.binaryType = "arraybuffer";
@@ -315,13 +370,10 @@ export default function TaskDetailScreen() {
 
         ws.onopen = () => {
           console.log("WebSocket connected");
-          ws.send(JSON.stringify({ type: "task", task: task.prompt }));
+          ws.send(JSON.stringify({ type: "task", task: task.prompt, captions: transcriptions }));
 
-          if (
-            !isPlayingRef.current &&
-            audioQueueRef.current.length === 0 &&
-            !audioIncomingRef.current
-          ) {
+          // Only capture first frame if not mid-playback from a reconnect
+          if (!audioIncomingRef.current && pendingAudioBytesRef.current === 0) {
             captureAndSendImage();
           }
 
@@ -351,11 +403,11 @@ export default function TaskDetailScreen() {
               }
 
               if (msg.type === "ready") {
-                await flushPcmBuffer();
-                if (
-                  !isPlayingRef.current &&
-                  audioQueueRef.current.length === 0
-                ) {
+                if (pendingAudioBytesRef.current > 0) {
+                  // Audio was received — wait for native buffer to drain, then capture
+                  scheduleAfterAudio();
+                } else {
+                  // No audio came — capture immediately
                   if (readyTimeoutRef.current)
                     clearTimeout(readyTimeoutRef.current);
                   readyTimeoutRef.current = setTimeout(() => {
@@ -366,14 +418,18 @@ export default function TaskDetailScreen() {
                 return;
               }
 
+              if (msg.type === "transcription" && typeof msg.text === "string") {
+                appendCaption(msg.text);
+                return;
+              }
+
               if (msg.type === "TASK_COMPLETE") {
                 completionPendingRef.current = true;
                 stopImages();
-                await flushPcmBuffer();
-                if (
-                  !isPlayingRef.current &&
-                  audioQueueRef.current.length === 0
-                ) {
+                if (pendingAudioBytesRef.current > 0) {
+                  // scheduleAfterAudio → onAudioDrained → complete()
+                  scheduleAfterAudio();
+                } else {
                   completionPendingRef.current = false;
                   complete();
                 }
@@ -471,6 +527,41 @@ export default function TaskDetailScreen() {
           </TouchableOpacity>
         </View>
       </SafeAreaView>
+
+      {/* Caption overlay */}
+      {transcriptions && captionText.length > 0 && (
+        <View
+          pointerEvents="none"
+          style={{
+            position: "absolute",
+            bottom: 48,
+            left: 20,
+            right: 20,
+            alignItems: "center",
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: "rgba(0,0,0,0.65)",
+              borderRadius: 16,
+              paddingHorizontal: 18,
+              paddingVertical: 12,
+            }}
+          >
+            <Text
+              style={{
+                color: "#fff",
+                fontSize: 16,
+                fontWeight: "500",
+                lineHeight: 22,
+                textAlign: "center",
+              }}
+            >
+              {captionText}
+            </Text>
+          </View>
+        </View>
+      )}
 
       {/* Loading overlay */}
       {isLoading && (

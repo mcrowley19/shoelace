@@ -1,17 +1,11 @@
 import React from "react";
-import {
-  View,
-  Text,
-  ScrollView,
-  TouchableOpacity,
-  StyleSheet,
-} from "react-native";
+import { View, Text, ScrollView, StyleSheet } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Colors } from "@/constants/theme";
 import { useTasks } from "@/context/tasks-context";
 
 export default function CompletedScreen() {
-  const { tasks, toggleTask } = useTasks();
+  const { tasks } = useTasks();
   const insets = useSafeAreaInsets();
   const completed = tasks.filter((t) => t.completed);
 
@@ -27,7 +21,7 @@ export default function CompletedScreen() {
       <View style={s.header}>
         <Text style={s.title}>Completed</Text>
         <Text style={s.subtitle}>
-          {completed.length} Skill{completed.length !== 1 ? "s" : ""} done
+          {completed.length} skill{completed.length !== 1 ? "s" : ""} learned
         </Text>
       </View>
 
@@ -49,14 +43,6 @@ export default function CompletedScreen() {
               <Text style={s.taskName}>{task.text}</Text>
               {task.time && <Text style={s.taskTime}>◷ {task.time}</Text>}
             </View>
-            <TouchableOpacity
-              style={s.undoBtn}
-              onPress={() => toggleTask(task.id)}
-              accessibilityLabel={`Mark ${task.text} incomplete`}
-              accessibilityRole="button"
-            >
-              <Text style={s.undoText}>Undo</Text>
-            </TouchableOpacity>
           </View>
         ))
       )}
@@ -142,16 +128,5 @@ const s = StyleSheet.create({
     fontSize: 13,
     color: C.muted,
     marginTop: 2,
-  },
-  undoBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 10,
-    backgroundColor: C.primaryLight,
-  },
-  undoText: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: C.primary,
   },
 });

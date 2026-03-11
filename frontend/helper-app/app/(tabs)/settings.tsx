@@ -9,12 +9,13 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Colors } from "@/constants/theme";
+import { useSettings } from "@/context/settings-context";
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
+  const { soundEffects, setSoundEffects, transcriptions, setTranscriptions } =
+    useSettings();
 
-  const [voiceGuidance, setVoiceGuidance] = useState(true);
-  const [soundEffects, setSoundEffects] = useState(true);
   const [largeText, setLargeText] = useState(false);
   const [notifications, setNotifications] = useState(false);
 
@@ -35,10 +36,10 @@ export default function SettingsScreen() {
       <Text style={s.sectionLabel}>AI Guidance</Text>
       <View style={s.group}>
         <SettingRow
-          label="Voice guidance"
-          description="Hear spoken instructions during tasks"
-          value={voiceGuidance}
-          onToggle={setVoiceGuidance}
+          label="Captions"
+          description="Include transcriptions in each AI response"
+          value={transcriptions}
+          onToggle={setTranscriptions}
         />
         <View style={s.divider} />
         <SettingRow
@@ -46,24 +47,6 @@ export default function SettingsScreen() {
           description="Play a sound when a task is completed"
           value={soundEffects}
           onToggle={setSoundEffects}
-        />
-      </View>
-
-      {/* ── Accessibility ── */}
-      <Text style={s.sectionLabel}>Accessibility</Text>
-      <View style={s.group}>
-        <SettingRow
-          label="Large text"
-          description="Increase text size throughout the app"
-          value={largeText}
-          onToggle={setLargeText}
-        />
-        <View style={s.divider} />
-        <SettingRow
-          label="Task reminders"
-          description="Get notified when a task is scheduled"
-          value={notifications}
-          onToggle={setNotifications}
         />
       </View>
 
