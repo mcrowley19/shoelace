@@ -7,9 +7,15 @@ import { Colors } from "@/constants/theme";
 import { s } from "@/styles/task-setup";
 
 const TASK_IMAGES: Record<string, any> = {
-  "Make toast": require("@/assets/images/make_toast_guide.png"),
-  "Fold clothes": require("@/assets/images/fold_clothes_guide.png"),
-  "Tie shoelaces": require("@/assets/images/tie_shoes_guide.png"),
+  "Make toast": require("@/assets/images/guides/make_toast_guide.png"),
+  "Fold a shirt": require("@/assets/images/guides/shirt_guide.png"),
+  "Fold trousers": require("@/assets/images/guides/trousers_guide.png"),
+  "Tie shoelaces": require("@/assets/images/guides/tie_shoes_guide.png"),
+  "Make tea": require("@/assets/images/guides/tea_guide.png"),
+  "Make a bed": require("@/assets/images/guides/make_bed_guide.png"),
+  "Open Facebook": require("@/assets/images/guides/computer_guide.png"),
+  "Send an email": require("@/assets/images/guides/computer_guide.png"),
+  "Search on Google": require("@/assets/images/guides/computer_guide.png"),
 };
 
 const PLACEHOLDER_COLORS: Record<string, string> = {

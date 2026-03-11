@@ -61,10 +61,15 @@ function getDateLine(): string {
 }
 
 const TASK_IMAGES: Record<string, any> = {
-  "Make toast": require("@/assets/images/toast.png"),
-  "Fold a shirt": require("@/assets/images/fold_clothes.png"),
-  "Fold trousers": require("@/assets/images/fold_clothes.png"),
-  "Tie shoelaces": require("@/assets/images/tie_shoes.png"),
+  "Make toast": require("@/assets/images/task-covers/toast.png"),
+  "Fold a shirt": require("@/assets/images/task-covers/fold_clothes.png"),
+  "Fold trousers": require("@/assets/images/task-covers/fold_trousers.png"),
+  "Tie shoelaces": require("@/assets/images/task-covers/tie_shoes.png"),
+  "Send an email": require("@/assets/images/task-covers/send_email.png"),
+  "Search on Google": require("@/assets/images/task-covers/google.png"),
+  "Open Facebook": require("@/assets/images/task-covers/open_facebook.png"),
+  "Make tea": require("@/assets/images/task-covers/tea.png"),
+  "Make a bed": require("@/assets/images/task-covers/bed.png"),
 };
 
 export default function HomeScreen() {
@@ -91,16 +96,23 @@ export default function HomeScreen() {
         <Text style={s.dateLine}>{getDateLine()}</Text>
       </View>
 
-      {/* ── The Fundamentals ── */}
+      {/* ── Clothes ── */}
       <TaskCarousel
-        label="The fundamentals"
-        tasks={tasks.filter((t) => t.category === "fundamentals")}
+        label="Clothes"
+        tasks={tasks.filter((t) => t.category === "clothes")}
         s={s}
       />
 
-      {/* ── Basic computer skills ── */}
+      {/* ── Cooking and domestic work ── */}
       <TaskCarousel
-        label="Basic computer skills"
+        label="Cooking and domestic work"
+        tasks={tasks.filter((t) => t.category === "cooking")}
+        s={s}
+      />
+
+      {/* ── Computer skills ── */}
+      <TaskCarousel
+        label="Computer skills"
         tasks={tasks.filter((t) => t.category === "programming")}
         s={s}
       />

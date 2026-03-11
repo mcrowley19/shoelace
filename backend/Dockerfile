@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     "google-genai==1.65.0" \
-    python-multipart
+    python-multipart \
+    pillow
 
 
 EXPOSE 8080
