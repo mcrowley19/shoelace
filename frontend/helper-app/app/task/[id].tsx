@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -19,6 +19,7 @@ import { useSettings } from "@/context/settings-context";
 import { makeStyles, loadingStyles } from "@/styles/task";
 import { v4 as uuidv4 } from "uuid";
 import "react-native-get-random-values";
+import { Audio } from "expo-av";
 import { useCameraDevice, useCameraPermission } from "@/utils/vision-camera";
 import { playDing } from "@/utils/audio";
 import TaskCamera from "@/components/TaskCamera";
@@ -28,6 +29,7 @@ const WS_URL = "wss://task-agent-746295074769.europe-west1.run.app/live";
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1000;
+const FRAME_DELAY_MS = 1500;
 
 export default function TaskDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -62,45 +64,62 @@ export default function TaskDetailScreen() {
   const [connectionError, setConnectionError] = useState(false);
   const loadingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firstAudioRef = useRef(false);
+  const everReceivedAudioRef = useRef(false);
+  const voiceResponsePendingRef = useRef(false);
   const [showCompletion, setShowCompletion] = useState(false);
   const overlayOpacity = useRef(new Animated.Value(0)).current;
   const tickScale = useRef(new Animated.Value(0.4)).current;
 
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const frameInFlightRef = useRef(false);
+  const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const frameDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [captionText, setCaptionText] = useState("");
   const captionResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingWordsRef = useRef<string[]>([]);
   const wordRevealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const isRecordingRef = useRef(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const recordingPulse = useRef(new Animated.Value(1)).current;
+
+  // Serialises decodePCMInBase64 calls so buffers are enqueued in order.
+  const decodeChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Counts decode operations still in flight (started but not yet enqueued).
+  const pendingDecodesRef = useRef(0);
+
+  useEffect(() => {
+    if (isRecording) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(recordingPulse, { toValue: 1.5, duration: 700, useNativeDriver: true }),
+          Animated.timing(recordingPulse, { toValue: 1, duration: 700, useNativeDriver: true }),
+        ]),
+      ).start();
+    } else {
+      recordingPulse.stopAnimation();
+      recordingPulse.setValue(1);
+    }
+  }, [isRecording]);
+
   const s = makeStyles();
   const userId = useRef<string>("");
 
-  const scheduleNextFrame = useCallback(() => {
-    if (doneRef.current || completionPendingRef.current) return;
-    if (readyTimeoutRef.current) clearTimeout(readyTimeoutRef.current);
-    readyTimeoutRef.current = setTimeout(() => {
-      readyTimeoutRef.current = null;
-      captureAndSendImage();
-    }, 300);
-  }, []);
-
   /**
    * Called when all queued audio has drained (either via onBufferEnded or
-   * a duration-based timer). Triggers next frame capture or task completion.
+   * a duration-based timer). Triggers task completion if pending.
    */
   const onAudioDrained = useCallback(() => {
-    pendingAudioBytesRef.current = 0;
     audioIncomingRef.current = false;
 
     if (completionPendingRef.current) {
       completionPendingRef.current = false;
       completeRef.current();
-    } else {
-      scheduleNextFrame();
     }
-  }, [scheduleNextFrame]);
+  }, []);
 
   /**
    * Initialise AudioContext + AudioBufferQueueSourceNode for this session.
@@ -117,12 +136,15 @@ export default function TaskDetailScreen() {
     node.connect(ctx.destination);
     node.start(0);
 
-    // Fires when the last enqueued buffer finishes playing.
+    // Fires whenever the native queue empties. Guard against calling onAudioDrained
+    // while decode operations are still in flight — more buffers will be enqueued
+    // shortly and onEnded will fire again when those finish.
     node.onEnded = () => {
       if (audioPlaybackTimerRef.current) {
         clearTimeout(audioPlaybackTimerRef.current);
         audioPlaybackTimerRef.current = null;
       }
+      if (pendingDecodesRef.current > 0) return;
       onAudioDrained();
     };
 
@@ -136,11 +158,22 @@ export default function TaskDetailScreen() {
    */
   const accumulatePcm = useCallback(
     (chunk: ArrayBuffer) => {
+      if (isRecordingRef.current) return;
+      // Discard stale audio from a frame that was in-flight when voice recording started.
+      // Once frameInFlightRef is cleared (by the "ready" signal from the old frame),
+      // the next audio is the voice response and should play.
+      if (voiceResponsePendingRef.current && frameInFlightRef.current) return;
+      if (!audioContextRef.current) {
+        initAudio(); // create/recreate context (first time or after interrupt)
+      }
       if (!firstAudioRef.current) {
         firstAudioRef.current = true;
         setIsLoading(false);
-        initAudio(); // ensure context exists before first write
       }
+      if (!everReceivedAudioRef.current) {
+        everReceivedAudioRef.current = true;
+      }
+      voiceResponsePendingRef.current = false;
       audioIncomingRef.current = true;
 
       // 2-byte align for 16-bit samples
@@ -156,30 +189,35 @@ export default function TaskDetailScreen() {
 
       // Enqueue onto the native audio ring buffer
       const ctx = audioContextRef.current;
-      const node = queueNodeRef.current;
-      if (!ctx || !node) return;
+      if (!ctx || !queueNodeRef.current) return;
 
-      ctx
-        .decodePCMInBase64(base64, 24000, 1, true)
+      // Serialise decodes so buffers are always enqueued in arrival order.
+      pendingDecodesRef.current += 1;
+      pendingAudioBytesRef.current += alignedLen;
+      const capturedCtx = ctx;
+      decodeChainRef.current = decodeChainRef.current
+        .then(() => capturedCtx.decodePCMInBase64(base64, 24000, 1, true))
         .then((audioBuffer) => {
+          pendingDecodesRef.current = Math.max(0, pendingDecodesRef.current - 1);
           if (doneRef.current || !queueNodeRef.current) return;
           queueNodeRef.current.enqueueBuffer(audioBuffer);
         })
-        .catch((err) => console.warn("decodePCMInBase64 error:", err));
-
-      pendingAudioBytesRef.current += alignedLen;
+        .catch((err) => {
+          pendingDecodesRef.current = Math.max(0, pendingDecodesRef.current - 1);
+          console.warn("decodePCMInBase64 error:", err);
+        });
     },
     [initAudio],
   );
 
   /**
-   * Called on "ready" signal. Sets a timer for the estimated remaining playback
-   * duration, after which onAudioDrained fires (unless onended beats it).
+   * Called on TASK_COMPLETE when audio is pending. Sets a timer for the estimated
+   * remaining playback duration as a fallback; node.onEnded fires first if audio
+   * truly drains before the estimate.
    */
   const scheduleAfterAudio = useCallback(() => {
     const durationMs =
       (pendingAudioBytesRef.current / (24000 * 1 * 2)) * 1000;
-    pendingAudioBytesRef.current = 0;
     audioIncomingRef.current = false;
 
     if (audioPlaybackTimerRef.current)
@@ -191,11 +229,106 @@ export default function TaskDetailScreen() {
     }, durationMs + 50); // 50 ms buffer for native drain jitter
   }, [onAudioDrained]);
 
+  const interruptAudio = useCallback(() => {
+    if (audioPlaybackTimerRef.current) {
+      clearTimeout(audioPlaybackTimerRef.current);
+      audioPlaybackTimerRef.current = null;
+    }
+    if (readyTimeoutRef.current) {
+      clearTimeout(readyTimeoutRef.current);
+      readyTimeoutRef.current = null;
+    }
+    pendingAudioBytesRef.current = 0;
+    audioIncomingRef.current = false;
+    decodeChainRef.current = Promise.resolve();
+    pendingDecodesRef.current = 0;
+    const node = queueNodeRef.current;
+    if (node) {
+      node.onEnded = null;
+      try { node.stop(0); } catch {}
+      queueNodeRef.current = null;
+    }
+    const ctx = audioContextRef.current;
+    if (ctx) {
+      try { ctx.close(); } catch {}
+      audioContextRef.current = null;
+    }
+  }, []);
+
+  const startVoiceInput = useCallback(async () => {
+    if (isRecordingRef.current || doneRef.current) return;
+    const { granted } = await Audio.requestPermissionsAsync();
+    if (!granted) return;
+    isRecordingRef.current = true;
+    setIsRecording(true);
+    interruptAudio();
+    try {
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const { recording } = await Audio.Recording.createAsync({
+        isMeteringEnabled: false,
+        android: {
+          extension: ".wav",
+          outputFormat: Audio.AndroidOutputFormat.DEFAULT,
+          audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 256000,
+        },
+        ios: {
+          extension: ".wav",
+          outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 256000,
+          bitDepthHint: 16,
+          linearPCMBitDepth: 16,
+          linearPCMIsBigEndian: false,
+          linearPCMIsFloat: false,
+        },
+        web: {},
+      });
+      recordingRef.current = recording;
+    } catch (err) {
+      console.warn("startVoiceInput error:", err);
+      isRecordingRef.current = false;
+      setIsRecording(false);
+    }
+  }, [interruptAudio]);
+
+  const stopVoiceInput = useCallback(async () => {
+    if (!isRecordingRef.current || !recordingRef.current) return;
+    isRecordingRef.current = false;
+    setIsRecording(false);
+    try {
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      recordingRef.current = null;
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+      if (uri) {
+        const base64 = await FileSystem.readAsStringAsync(uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN && !doneRef.current) {
+          ws.send(JSON.stringify({ type: "audio", data: base64 }));
+          voiceResponsePendingRef.current = true;
+        }
+        await FileSystem.deleteAsync(uri, { idempotent: true });
+      }
+    } catch (err) {
+      console.warn("stopVoiceInput error:", err);
+    }
+  }, []);
+
   const captureAndSendImage = async () => {
+    if (frameInFlightRef.current) return;
+    if (isRecordingRef.current || voiceResponsePendingRef.current) return;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (!cameraRef.current) return;
     try {
+      frameInFlightRef.current = true;
       const photo = await cameraRef.current.takePhoto({ flash: "off" });
       const base64 = await FileSystem.readAsStringAsync(
         `file://${photo.path}`,
@@ -204,6 +337,7 @@ export default function TaskDetailScreen() {
       ws.send(base64);
     } catch (err) {
       console.warn("Error capturing/sending image:", err);
+      frameInFlightRef.current = false;
     }
   };
 
@@ -218,6 +352,8 @@ export default function TaskDetailScreen() {
       // Reset audio state for new session
       pendingAudioBytesRef.current = 0;
       firstAudioRef.current = false;
+      everReceivedAudioRef.current = false;
+      voiceResponsePendingRef.current = false;
       audioIncomingRef.current = false;
       setIsLoading(true);
       setConnectionError(false);
@@ -227,6 +363,15 @@ export default function TaskDetailScreen() {
           clearTimeout(readyTimeoutRef.current);
           readyTimeoutRef.current = null;
         }
+        if (frameDelayTimerRef.current) {
+          clearTimeout(frameDelayTimerRef.current);
+          frameDelayTimerRef.current = null;
+        }
+        if (frameIntervalRef.current) {
+          clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = null;
+        }
+        frameInFlightRef.current = false;
         if (loadingTimeoutRef.current) {
           clearTimeout(loadingTimeoutRef.current);
           loadingTimeoutRef.current = null;
@@ -272,6 +417,8 @@ export default function TaskDetailScreen() {
       const stopAudio = () => {
         audioIncomingRef.current = false;
         pendingAudioBytesRef.current = 0;
+        decodeChainRef.current = Promise.resolve();
+        pendingDecodesRef.current = 0;
 
         if (audioPlaybackTimerRef.current) {
           clearTimeout(audioPlaybackTimerRef.current);
@@ -377,6 +524,16 @@ export default function TaskDetailScreen() {
             captureAndSendImage();
           }
 
+          // Fallback timer: keeps frames flowing every 3s if "ready" is slow
+          if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = setInterval(() => {
+            if (doneRef.current || completionPendingRef.current || isRecordingRef.current || voiceResponsePendingRef.current) return;
+            if (frameInFlightRef.current) return;
+            const wsNow = wsRef.current;
+            if (!wsNow || wsNow.readyState !== WebSocket.OPEN) return;
+            captureAndSendImage();
+          }, 1500);
+
           if (loadingTimeoutRef.current)
             clearTimeout(loadingTimeoutRef.current);
           loadingTimeoutRef.current = setTimeout(() => {
@@ -403,17 +560,15 @@ export default function TaskDetailScreen() {
               }
 
               if (msg.type === "ready") {
-                if (pendingAudioBytesRef.current > 0) {
-                  // Audio was received — wait for native buffer to drain, then capture
-                  scheduleAfterAudio();
-                } else {
-                  // No audio came — capture immediately
-                  if (readyTimeoutRef.current)
-                    clearTimeout(readyTimeoutRef.current);
-                  readyTimeoutRef.current = setTimeout(() => {
-                    readyTimeoutRef.current = null;
-                    captureAndSendImage();
-                  }, 0);
+                frameInFlightRef.current = false;
+                if (voiceResponsePendingRef.current) {
+                  // A frame that was in-flight before voice input just finished.
+                  // Don't capture a new frame — the voice response is being processed next.
+                  return;
+                }
+                if (isRecordingRef.current) return;
+                if (!doneRef.current && !completionPendingRef.current) {
+                  frameDelayTimerRef.current = setTimeout(captureAndSendImage, FRAME_DELAY_MS);
                 }
                 return;
               }
@@ -528,13 +683,63 @@ export default function TaskDetailScreen() {
         </View>
       </SafeAreaView>
 
+      {/* Mic button */}
+      {!showCompletion && !connectionError && (
+        <View
+          style={{
+            position: "absolute",
+            bottom: 44,
+            alignSelf: "center",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {isRecording && (
+            <Animated.View
+              style={{
+                position: "absolute",
+                top: -10,
+                left: -10,
+                right: -10,
+                bottom: -10,
+                borderRadius: 50,
+                backgroundColor: "rgba(220,38,38,0.22)",
+                transform: [{ scale: recordingPulse }],
+              }}
+            />
+          )}
+          <TouchableOpacity
+            onPressIn={startVoiceInput}
+            onPressOut={stopVoiceInput}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 10,
+              paddingHorizontal: 28,
+              paddingVertical: 15,
+              borderRadius: 40,
+              backgroundColor: isRecording ? "#DC2626" : "rgba(0,0,0,0.55)",
+              borderWidth: 1.5,
+              borderColor: isRecording ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.22)",
+            }}
+            accessibilityLabel="Hold to speak"
+            accessibilityRole="button"
+          >
+            <Text style={{ fontSize: 18 }}>🎤</Text>
+            <Text style={{ color: "#fff", fontSize: 15, fontWeight: "600", letterSpacing: 0.2 }}>
+              {isRecording ? "Listening…" : "Hold to speak"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {/* Caption overlay */}
       {transcriptions && captionText.length > 0 && (
         <View
           pointerEvents="none"
           style={{
             position: "absolute",
-            bottom: 48,
+            bottom: 118,
             left: 20,
             right: 20,
             alignItems: "center",
@@ -564,7 +769,7 @@ export default function TaskDetailScreen() {
       )}
 
       {/* Loading overlay */}
-      {isLoading && (
+      {isLoading && !everReceivedAudioRef.current && (
         <View style={loadingStyles.overlay} pointerEvents="none">
           <View style={loadingStyles.card}>
             <ActivityIndicator size="large" color="#2563EB" />

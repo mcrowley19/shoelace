@@ -13,10 +13,7 @@ import { router } from "expo-router";
 import { Colors } from "@/constants/theme";
 import { useTasks, Task } from "@/context/tasks-context";
 import { makeStyles } from "@/styles/tabs";
-
-const PLACEHOLDER_COLORS: Record<string, string> = {
-  programming: "#1E3A5F",
-};
+import { TASK_COVER_IMAGES, getPlaceholderColor } from "@/utils/taskAssets";
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const CARD_WIDTH = SCREEN_WIDTH * 0.72;
@@ -60,18 +57,6 @@ function getDateLine(): string {
   return `${DAYS[now.getDay()]}, ${now.getDate()} ${MONTHS[now.getMonth()]}`;
 }
 
-const TASK_IMAGES: Record<string, any> = {
-  "Make toast": require("@/assets/images/task-covers/toast.png"),
-  "Fold a shirt": require("@/assets/images/task-covers/fold_clothes.png"),
-  "Fold trousers": require("@/assets/images/task-covers/fold_trousers.png"),
-  "Tie shoelaces": require("@/assets/images/task-covers/tie_shoes.png"),
-  "Send an email": require("@/assets/images/task-covers/send_email.png"),
-  "Search on Google": require("@/assets/images/task-covers/google.png"),
-  "Open Facebook": require("@/assets/images/task-covers/open_facebook.png"),
-  "Make tea": require("@/assets/images/task-covers/tea.png"),
-  "Make a bed": require("@/assets/images/task-covers/bed.png"),
-};
-
 export default function HomeScreen() {
   const C = Colors;
   const { tasks } = useTasks();
@@ -90,27 +75,23 @@ export default function HomeScreen() {
       ]}
       showsVerticalScrollIndicator={false}
     >
-      {/* ── Greeting ── */}
       <View style={s.greetingBlock}>
         <Text style={s.greeting}>{getGreeting()}</Text>
         <Text style={s.dateLine}>{getDateLine()}</Text>
       </View>
 
-      {/* ── Clothes ── */}
       <TaskCarousel
         label="Clothes"
         tasks={tasks.filter((t) => t.category === "clothes")}
         s={s}
       />
 
-      {/* ── Cooking and domestic work ── */}
       <TaskCarousel
         label="Cooking and domestic work"
         tasks={tasks.filter((t) => t.category === "cooking")}
         s={s}
       />
 
-      {/* ── Computer skills ── */}
       <TaskCarousel
         label="Computer skills"
         tasks={tasks.filter((t) => t.category === "programming")}
@@ -158,8 +139,8 @@ function TaskCarousel({
 }
 
 function TaskCard({ task, onPress }: { task: Task; onPress: () => void }) {
-  const image = TASK_IMAGES[task.text];
-  const placeholderColor = PLACEHOLDER_COLORS[task.category] ?? Colors.primary;
+  const image = TASK_COVER_IMAGES[task.text];
+  const placeholderColor = getPlaceholderColor(task.category);
 
   return (
     <TouchableOpacity
@@ -179,7 +160,6 @@ function TaskCard({ task, onPress }: { task: Task; onPress: () => void }) {
       accessibilityLabel={`${task.text}${task.completed ? ", completed" : ""}, tap to start`}
       accessibilityRole="button"
     >
-      {/* Photo or placeholder */}
       {image ? (
         <Image
           source={image}
@@ -202,7 +182,6 @@ function TaskCard({ task, onPress }: { task: Task; onPress: () => void }) {
         </View>
       )}
 
-      {/* Info strip */}
       <View
         style={{
           flex: 1,
