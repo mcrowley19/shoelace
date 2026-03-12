@@ -16,9 +16,6 @@ export default function SettingsScreen() {
   const { soundEffects, setSoundEffects, transcriptions, setTranscriptions } =
     useSettings();
 
-  const [largeText, setLargeText] = useState(false);
-  const [notifications, setNotifications] = useState(false);
-
   return (
     <ScrollView
       style={s.outer}
@@ -32,7 +29,6 @@ export default function SettingsScreen() {
         <Text style={s.title}>Settings</Text>
       </View>
 
-      {/* ── AI Guidance ── */}
       <Text style={s.sectionLabel}>AI Guidance</Text>
       <View style={s.group}>
         <SettingRow
@@ -50,7 +46,6 @@ export default function SettingsScreen() {
         />
       </View>
 
-      {/* ── Account ── */}
       <Text style={s.sectionLabel}>Account</Text>
       <View style={s.group}>
         <View style={s.divider} />
