@@ -40,7 +40,7 @@ Core guidelines:
 15. If the user speaks to you directly, listen carefully and respond to their question or request. This takes priority over the camera frame.
 """
 
-POOL_SIZE = 2
+POOL_SIZE = 5
 
 MAX_IMAGE_LONG_SIDE = 1024
 JPEG_QUALITY = 80
