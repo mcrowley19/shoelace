@@ -56,7 +56,7 @@ async def _process_gemini_response(
     websocket: WebSocket,
     done: asyncio.Event,
     captions: bool = False,
-    timeout: int = 5,
+    timeout: int = 8,
 ) -> tuple[bool, str]:
     """Process Gemini response and send audio to frontend. Returns (task_complete, transcription)."""
     MIN_PCM_BYTES = 960  # 20ms at 24kHz 16-bit mono
@@ -131,6 +131,16 @@ def _build_frame_reminder(last_transcription: str) -> str:
     return base
 
 
+async def _safe_send(websocket: WebSocket, send_func, *args, **kwargs):
+    """Guard websocket sends against closed connections."""
+    try:
+        if websocket.client_state.name != "CONNECTED":
+            return
+        await send_func(websocket, *args, **kwargs)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+
+
 async def _process_frame(
     session,
     websocket: WebSocket,
@@ -149,6 +159,10 @@ async def _process_frame(
     response so the AI does not repeat itself.
     """
     print(f"ln_pf: processing frame (base64 len={len(frame)}, inject_task={task_prompt is not None})", flush=True)
+
+    def _is_connected():
+        return websocket.client_state.name == "CONNECTED"
+
     try:
         raw_bytes = base64.b64decode(frame)
         print(f"ln_pf: decoded frame to {len(raw_bytes)} bytes", flush=True)
@@ -157,10 +171,15 @@ async def _process_frame(
     except Exception as e:
         print(f"ln_pf: error decoding/resizing frame: {e}", flush=True)
         if not done.is_set():
-            await _send_ready_signal(websocket)
+            await _safe_send(websocket, _send_ready_signal)
         return False, last_transcription
 
     try:
+        if not _is_connected():
+            print("ln_pf: websocket gone before Gemini send, aborting", flush=True)
+            done.set()
+            return False, last_transcription
+
         parts = []
         if task_prompt:
             parts.append(Part(text=task_prompt))
@@ -174,26 +193,40 @@ async def _process_frame(
             turn_complete=True,
         )
 
+        if not _is_connected():
+            print("ln_pf: websocket gone after Gemini send, aborting", flush=True)
+            done.set()
+            return False, last_transcription
+
         transcription_complete, transcription = await _process_gemini_response(session, websocket, done, captions)
 
         if transcription_complete:
             print("ln_pf: task complete, setting done event", flush=True)
             done.set()
-            await _send_task_complete(websocket)
+            await _safe_send(websocket, _send_task_complete)
             return True, transcription
 
         _drain_frame_queue(frame_queue)
         if not done.is_set():
-            await _send_ready_signal(websocket)
+            await _safe_send(websocket, _send_ready_signal)
 
         return False, transcription
+
     except WebSocketDisconnect:
+        print("ln_pf: client disconnected, setting done", flush=True)
+        done.set()
         raise
+
     except Exception as e:
+        if not _is_connected():
+            print(f"ln_pf: ignoring error on dead socket: {e}", flush=True)
+            done.set()
+            return False, last_transcription
+
         print(f"ln_pf: Gemini session error: {e}", flush=True)
         logger.exception(f"Gemini session error: {e}")
         done.set()
-        await _send_error(websocket, str(e))
+        await _safe_send(websocket, _send_error, str(e))
         return False, last_transcription
 
 

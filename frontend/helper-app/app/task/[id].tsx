@@ -29,7 +29,7 @@ const WS_URL = "wss://task-agent-746295074769.europe-west1.run.app/live";
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1000;
-const FRAME_DELAY_MS = 1500;
+const FRAME_DELAY_MS = 2000;
 
 export default function TaskDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -75,11 +75,16 @@ export default function TaskDetailScreen() {
   const frameInFlightRef = useRef(false);
   const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const frameDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const readyForFrameRef = useRef(false);
 
   const [captionText, setCaptionText] = useState("");
-  const captionResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const captionResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const pendingWordsRef = useRef<string[]>([]);
-  const wordRevealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wordRevealTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const isRecordingRef = useRef(false);
@@ -95,8 +100,16 @@ export default function TaskDetailScreen() {
     if (isRecording) {
       Animated.loop(
         Animated.sequence([
-          Animated.timing(recordingPulse, { toValue: 1.5, duration: 700, useNativeDriver: true }),
-          Animated.timing(recordingPulse, { toValue: 1, duration: 700, useNativeDriver: true }),
+          Animated.timing(recordingPulse, {
+            toValue: 1.5,
+            duration: 700,
+            useNativeDriver: true,
+          }),
+          Animated.timing(recordingPulse, {
+            toValue: 1,
+            duration: 700,
+            useNativeDriver: true,
+          }),
         ]),
       ).start();
     } else {
@@ -118,6 +131,13 @@ export default function TaskDetailScreen() {
     if (completionPendingRef.current) {
       completionPendingRef.current = false;
       completeRef.current();
+      return;
+    }
+
+    // Audio finished — capture next frame immediately if ready signal already arrived
+    if (readyForFrameRef.current) {
+      readyForFrameRef.current = false;
+      captureAndSendImage();
     }
   }, []);
 
@@ -198,12 +218,18 @@ export default function TaskDetailScreen() {
       decodeChainRef.current = decodeChainRef.current
         .then(() => capturedCtx.decodePCMInBase64(base64, 24000, 1, true))
         .then((audioBuffer) => {
-          pendingDecodesRef.current = Math.max(0, pendingDecodesRef.current - 1);
+          pendingDecodesRef.current = Math.max(
+            0,
+            pendingDecodesRef.current - 1,
+          );
           if (doneRef.current || !queueNodeRef.current) return;
           queueNodeRef.current.enqueueBuffer(audioBuffer);
         })
         .catch((err) => {
-          pendingDecodesRef.current = Math.max(0, pendingDecodesRef.current - 1);
+          pendingDecodesRef.current = Math.max(
+            0,
+            pendingDecodesRef.current - 1,
+          );
           console.warn("decodePCMInBase64 error:", err);
         });
     },
@@ -216,8 +242,7 @@ export default function TaskDetailScreen() {
    * truly drains before the estimate.
    */
   const scheduleAfterAudio = useCallback(() => {
-    const durationMs =
-      (pendingAudioBytesRef.current / (24000 * 1 * 2)) * 1000;
+    const durationMs = (pendingAudioBytesRef.current / (24000 * 1 * 2)) * 1000;
     audioIncomingRef.current = false;
 
     if (audioPlaybackTimerRef.current)
@@ -245,12 +270,16 @@ export default function TaskDetailScreen() {
     const node = queueNodeRef.current;
     if (node) {
       node.onEnded = null;
-      try { node.stop(0); } catch {}
+      try {
+        node.stop(0);
+      } catch {}
       queueNodeRef.current = null;
     }
     const ctx = audioContextRef.current;
     if (ctx) {
-      try { ctx.close(); } catch {}
+      try {
+        ctx.close();
+      } catch {}
       audioContextRef.current = null;
     }
   }, []);
@@ -263,7 +292,10 @@ export default function TaskDetailScreen() {
     setIsRecording(true);
     interruptAudio();
     try {
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
       const { recording } = await Audio.Recording.createAsync({
         isMeteringEnabled: false,
         android: {
@@ -304,7 +336,10 @@ export default function TaskDetailScreen() {
       await recordingRef.current.stopAndUnloadAsync();
       const uri = recordingRef.current.getURI();
       recordingRef.current = null;
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+      });
       if (uri) {
         const base64 = await FileSystem.readAsStringAsync(uri, {
           encoding: FileSystem.EncodingType.Base64,
@@ -322,14 +357,18 @@ export default function TaskDetailScreen() {
   }, []);
 
   const captureAndSendImage = async () => {
-    if (frameInFlightRef.current) return;
+    if (frameInFlightRef.current || frameDelayTimerRef.current) return;
     if (isRecordingRef.current || voiceResponsePendingRef.current) return;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (!cameraRef.current) return;
     try {
       frameInFlightRef.current = true;
-      const photo = await cameraRef.current.takePhoto({ flash: "off" });
+      const photo = await cameraRef.current.takeSnapshot({
+        quality: 60,
+        skipMetadata: true,
+      });
+
       const base64 = await FileSystem.readAsStringAsync(
         `file://${photo.path}`,
         { encoding: FileSystem.EncodingType.Base64 },
@@ -355,6 +394,7 @@ export default function TaskDetailScreen() {
       everReceivedAudioRef.current = false;
       voiceResponsePendingRef.current = false;
       audioIncomingRef.current = false;
+      readyForFrameRef.current = false;
       setIsLoading(true);
       setConnectionError(false);
 
@@ -409,8 +449,10 @@ export default function TaskDetailScreen() {
               return;
             }
             const batch = pendingWordsRef.current.splice(0, 3);
-            setCaptionText((prev) => (prev ? prev + " " + batch.join(" ") : batch.join(" ")));
-          }, 350);
+            setCaptionText((prev) =>
+              prev ? prev + " " + batch.join(" ") : batch.join(" "),
+            );
+          }, 150);
         }
       };
 
@@ -517,7 +559,13 @@ export default function TaskDetailScreen() {
 
         ws.onopen = () => {
           console.log("WebSocket connected");
-          ws.send(JSON.stringify({ type: "task", task: task.prompt, captions: transcriptions }));
+          ws.send(
+            JSON.stringify({
+              type: "task",
+              task: task.prompt,
+              captions: transcriptions,
+            }),
+          );
 
           // Only capture first frame if not mid-playback from a reconnect
           if (!audioIncomingRef.current && pendingAudioBytesRef.current === 0) {
@@ -527,22 +575,28 @@ export default function TaskDetailScreen() {
           // Fallback timer: keeps frames flowing every 3s if "ready" is slow
           if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
           frameIntervalRef.current = setInterval(() => {
-            if (doneRef.current || completionPendingRef.current || isRecordingRef.current || voiceResponsePendingRef.current) return;
+            if (
+              doneRef.current ||
+              completionPendingRef.current ||
+              isRecordingRef.current ||
+              voiceResponsePendingRef.current
+            )
+              return;
             if (frameInFlightRef.current) return;
             const wsNow = wsRef.current;
             if (!wsNow || wsNow.readyState !== WebSocket.OPEN) return;
             captureAndSendImage();
-          }, 1500);
+          }, 800);
 
           if (loadingTimeoutRef.current)
             clearTimeout(loadingTimeoutRef.current);
           loadingTimeoutRef.current = setTimeout(() => {
             loadingTimeoutRef.current = null;
             if (!firstAudioRef.current && !doneRef.current) {
-              console.warn("No AI response within 45s — reconnecting");
+              console.warn("No AI response within 25s — reconnecting");
               ws.close();
             }
-          }, 45000);
+          }, 25000);
         };
 
         ws.onmessage = async (event) => {
@@ -568,12 +622,23 @@ export default function TaskDetailScreen() {
                 }
                 if (isRecordingRef.current) return;
                 if (!doneRef.current && !completionPendingRef.current) {
-                  frameDelayTimerRef.current = setTimeout(captureAndSendImage, FRAME_DELAY_MS);
+                  // If audio is still playing, defer frame capture until it drains
+                  if (audioIncomingRef.current) {
+                    readyForFrameRef.current = true;
+                    return;
+                  }
+                  frameDelayTimerRef.current = setTimeout(
+                    captureAndSendImage,
+                    FRAME_DELAY_MS,
+                  );
                 }
                 return;
               }
 
-              if (msg.type === "transcription" && typeof msg.text === "string") {
+              if (
+                msg.type === "transcription" &&
+                typeof msg.text === "string"
+              ) {
                 appendCaption(msg.text);
                 return;
               }
@@ -720,13 +785,22 @@ export default function TaskDetailScreen() {
               borderRadius: 40,
               backgroundColor: isRecording ? "#DC2626" : "rgba(0,0,0,0.55)",
               borderWidth: 1.5,
-              borderColor: isRecording ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.22)",
+              borderColor: isRecording
+                ? "rgba(255,255,255,0.2)"
+                : "rgba(255,255,255,0.22)",
             }}
             accessibilityLabel="Hold to speak"
             accessibilityRole="button"
           >
             <Text style={{ fontSize: 18 }}>🎤</Text>
-            <Text style={{ color: "#fff", fontSize: 15, fontWeight: "600", letterSpacing: 0.2 }}>
+            <Text
+              style={{
+                color: "#fff",
+                fontSize: 15,
+                fontWeight: "600",
+                letterSpacing: 0.2,
+              }}
+            >
               {isRecording ? "Listening…" : "Hold to speak"}
             </Text>
           </TouchableOpacity>
