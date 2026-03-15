@@ -10,7 +10,7 @@ Due to the use of non-expo packages, you must build the app locally on an androi
 https://docs.expo.dev/guides/local-app-development/
 
 Alternatively, a pre-built apk of the app is available on:
-https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/b91b46c7-0ae4-4344-9e5e-fcd11edf90f2
+https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/58b3dda0-e49f-4564-bf0f-fe6759410c9d
 
 ## System Architecture
 
