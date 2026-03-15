@@ -2,13 +2,21 @@
 
 Shoelace is an accessibility assistant mobile app built with React Native (Expo). It guides users through everyday tasks by capturing camera snapshots, sending them to Google's Gemini Live API, and returning step-by-step audio instructions in real time.
 
+![Logo](shoelace.png)
+
+## Running the App
+
+Due to the use of non-expo packages, the app cannot be tested using the traditional method of cloning the repo and using the Expo Go CLI
+
+A pre-built apk of the app is available on https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/b91b46c7-0ae4-4344-9e5e-fcd11edf90f2
+
 ## System Architecture
 
 ![System architecture](sysDiagram.png)
 
 ### Frontend
 
-**Stack:** React Native, Expo, Expo Router, TypeScript
+**Stack:** React Native
 
 The frontend is organized as a file-based routed Expo app:
 
@@ -19,9 +27,9 @@ frontend/helper-app/
 │   ├── (tabs)/              # Tab navigation
 │   │   ├── index.tsx        # Home — task carousel by category
 │   │   ├── completed.tsx    # Completed tasks list
-│   │   └── settings.tsx     # Sound effects & transcription toggles
+│   │   └── settings.tsx     # Transcription toggle
 │   └── task/
-│       ├── setup/[id].tsx   # Pre-task instructions
+│       ├── setup/[id].tsx   # Pre-task setup guides
 │       └── [id].tsx         # Active task session (camera + audio)
 ├── components/              # TaskCamera, CompletionOverlay, etc.
 ├── context/                 # React Context providers
@@ -32,8 +40,6 @@ frontend/helper-app/
 ├── styles/                  # StyleSheet definitions
 └── utils/                   # Camera, audio, and asset helpers
 ```
-
-**User flow:** Home → select task → setup screen → start session (camera opens).
 
 During a session, three hooks collaborate:
 
@@ -47,7 +53,7 @@ During a session, three hooks collaborate:
 
 ### Backend
 
-**Stack:** Python, FastAPI, Google Gemini Live API
+**Stack:** FastAPI, Google Gemini Live API
 
 ```
 backend/
@@ -78,21 +84,3 @@ The backend maintains a pool of pre-warmed Gemini Live sessions for instant conn
 | Server → Client | Transcription | `{ type: "transcription", text: "..." }`  |
 | Server → Client | Ready         | `{ type: "ready" }` — request next frame  |
 | Server → Client | Complete      | `{ type: "TASK_COMPLETE" }`               |
-
-## Running the App
-
-### Backend
-
-```bash
-cd backend
-pipenv install
-pipenv run uvicorn agent:app --host 0.0.0.0 --port 8000
-```
-
-### Frontend
-
-```bash
-cd frontend/helper-app
-npm install
-npx expo start
-```

@@ -1,15 +1,23 @@
 {
   "expo": {
-    "name": "helper-app",
+    "name": "Shoelace",
     "slug": "helper-app",
     "scheme": "helperapp",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/images/shoelace_icon.png",
     "userInterfaceStyle": "light",
-    "assetBundlePatterns": [
-      "**/*"
-    ],
+    "splash": {
+      "image": "./assets/images/shoelace.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": ["**/*"],
     "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/shoelace_icon.png",
+        "backgroundColor": "#ffffff"
+      },
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
@@ -24,13 +32,13 @@
       [
         "react-native-vision-camera",
         {
-          "cameraPermissionText": "Helper App needs camera access to provide AI guidance."
+          "cameraPermissionText": "Shoelace needs camera access to provide AI guidance."
         }
       ],
       [
         "expo-av",
         {
-          "microphonePermission": "Helper App needs microphone permission.",
+          "microphonePermission": "Shoelace needs microphone permission.",
           "audioAndVideoOnlyPermission": true
         }
       ]

@@ -37,29 +37,7 @@ export default function SettingsScreen() {
           value={transcriptions}
           onToggle={setTranscriptions}
         />
-        <View style={s.divider} />
-        <SettingRow
-          label="Sound effects"
-          description="Play a sound when a task is completed"
-          value={soundEffects}
-          onToggle={setSoundEffects}
-        />
       </View>
-
-      <Text style={s.sectionLabel}>Account</Text>
-      <View style={s.group}>
-        <View style={s.divider} />
-        <TouchableOpacity
-          style={s.linkRow}
-          accessibilityRole="button"
-          accessibilityLabel="Privacy policy"
-        >
-          <Text style={s.linkLabel}>Privacy policy</Text>
-          <Text style={s.chevron}>›</Text>
-        </TouchableOpacity>
-      </View>
-
-      <Text style={s.version}>Helper App · Version 1.0</Text>
     </ScrollView>
   );
 }
