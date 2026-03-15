@@ -22,7 +22,7 @@ import { playDing } from "@/utils/audio";
 import TaskCamera from "@/components/TaskCamera";
 import CompletionOverlay from "@/components/CompletionOverlay";
 
-const WS_URL = "REDACTED";
+const WS_URL = process.env.EXPO_PUBLIC_WS_URL!;
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1000;
