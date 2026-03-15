@@ -33,13 +33,18 @@
           "microphonePermission": "Helper App needs microphone permission.",
           "audioAndVideoOnlyPermission": true
         }
-      ],
+      ]
     ],
     "ios": {
       "infoPlist": {
         "NSCameraUsageDescription": "Helper App needs camera access to provide AI guidance."
       },
       "bundleIdentifier": "com.helperapp"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "7f542c5b-e6c3-4197-86a2-9da760f6b9ab"
+      }
     }
   }
 }
