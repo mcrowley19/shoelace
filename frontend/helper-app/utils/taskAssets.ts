@@ -22,6 +22,7 @@ export const TASK_GUIDE_IMAGES: Record<string, any> = {
   "Open Facebook": require("@/assets/images/guides/computer_guide.png"),
   "Send an email": require("@/assets/images/guides/computer_guide.png"),
   "Search on Google": require("@/assets/images/guides/computer_guide.png"),
+  "Brush your teeth": require("@/assets/images/guides/brush_teeth_guide.png"),
   "Put in contacts": require("../assets/images/guides/contacts_guide.png"),
 };
 
