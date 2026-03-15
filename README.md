@@ -8,7 +8,8 @@ Shoelace is an accessibility assistant mobile app built with React Native (Expo)
 
 Due to the use of non-expo packages, the app cannot be tested using the traditional method of cloning the repo and using the Expo Go CLI
 
-A pre-built apk of the app is available on https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/b91b46c7-0ae4-4344-9e5e-fcd11edf90f2
+A pre-built apk of the app is available on:
+https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/b91b46c7-0ae4-4344-9e5e-fcd11edf90f2
 
 ## System Architecture
 
