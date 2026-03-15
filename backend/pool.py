@@ -1,7 +1,11 @@
 import asyncio
+import time
 from google.genai.types import LiveConnectConfig, AudioTranscriptionConfig
 
 from config import client, BASE_SYSTEM_INSTRUCTION, POOL_SIZE
+
+# Discard pooled sessions older than this (seconds)
+_MAX_SESSION_AGE = 120
 
 
 class GeminiSessionPool:
@@ -24,7 +28,7 @@ class GeminiSessionPool:
             ),
         )
         session = await asyncio.wait_for(connect_cm.__aenter__(), timeout=15)
-        return session, connect_cm
+        return session, connect_cm, time.monotonic()
 
     async def _add_one(self):
         try:
@@ -33,7 +37,7 @@ class GeminiSessionPool:
                 self._queue.put_nowait(pair)
                 print("Pool: session added", flush=True)
             except asyncio.QueueFull:
-                _, connect_cm = pair
+                _, connect_cm, _ = pair
                 try:
                     await connect_cm.__aexit__(None, None, None)
                 except Exception:
@@ -48,22 +52,35 @@ class GeminiSessionPool:
 
     async def acquire(self):
         """
-        Return a (session, connect_cm) pair immediately from the pool if available,
-        otherwise fall back to a fresh connection. Always replenishes in the background.
+        Return a (session, connect_cm, created_at) tuple from the pool if available
+        and not stale, otherwise fall back to a fresh connection.
+        Always replenishes in the background.
         """
-        try:
-            pair = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pair = await self._make_session()
-        asyncio.create_task(self._add_one())  
+        now = time.monotonic()
+        while True:
+            try:
+                pair = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pair = await self._make_session()
+                break
+            # Discard sessions that have been sitting too long
+            if now - pair[2] > _MAX_SESSION_AGE:
+                print("Pool: discarding stale session", flush=True)
+                await self._close_pair(pair)
+                continue
+            break
+        asyncio.create_task(self._add_one())
         return pair
 
-    async def close_pair(self, pair):
-        _, connect_cm = pair
+    async def _close_pair(self, pair):
+        _, connect_cm, _ = pair
         try:
             await connect_cm.__aexit__(None, None, None)
         except Exception:
             pass
+
+    async def close_pair(self, pair):
+        await self._close_pair(pair)
 
 
 session_pool = GeminiSessionPool(POOL_SIZE)

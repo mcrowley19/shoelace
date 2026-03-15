@@ -26,7 +26,7 @@ const WS_URL = "REDACTED";
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1000;
-const FRAME_DELAY_MS = 10000;
+const FRAME_DELAY_MS = 3000;
 
 export default function TaskDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -187,7 +187,18 @@ export default function TaskDetailScreen() {
 
     node.onEnded = () => {
       if (pendingDecodesRef.current > 0) return;
-      onAudioDrained();
+      // Debounce: the queue can momentarily empty between chunks of the
+      // same response while the next chunk is still decoding or in-flight
+      // from the backend.  Wait a short period so we don't prematurely
+      // treat the response as finished and fire off the next frame.
+      if (audioPlaybackTimerRef.current) {
+        clearTimeout(audioPlaybackTimerRef.current);
+      }
+      audioPlaybackTimerRef.current = setTimeout(() => {
+        audioPlaybackTimerRef.current = null;
+        if (pendingDecodesRef.current > 0) return;
+        onAudioDrained();
+      }, 300);
     };
 
     queueNodeRef.current = node;
@@ -210,6 +221,12 @@ export default function TaskDetailScreen() {
       voiceResponsePendingRef.current = false;
       audioIncomingRef.current = true;
 
+      // Cancel any pending "audio drained" debounce — more audio is arriving.
+      if (audioPlaybackTimerRef.current) {
+        clearTimeout(audioPlaybackTimerRef.current);
+        audioPlaybackTimerRef.current = null;
+      }
+
       const raw = new Uint8Array(chunk);
       const alignedLen = raw.length & ~1;
       if (alignedLen === 0) return;
@@ -227,7 +244,7 @@ export default function TaskDetailScreen() {
       pendingDecodesRef.current += 1;
       const capturedCtx = ctx;
       decodeChainRef.current = decodeChainRef.current
-        .then(() => capturedCtx.decodePCMInBase64(base64, 24000, 1, true))
+        .then(() => capturedCtx.decodePCMInBase64(base64, 24000, 1, false))
         .then((audioBuffer) => {
           pendingDecodesRef.current = Math.max(
             0,
@@ -343,6 +360,7 @@ export default function TaskDetailScreen() {
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
       });
+      initAudio();
       if (uri) {
         const base64 = await FileSystem.readAsStringAsync(uri, {
           encoding: FileSystem.EncodingType.Base64,
@@ -357,7 +375,7 @@ export default function TaskDetailScreen() {
     } catch (err) {
       console.warn("stopVoiceInput error:", err);
     }
-  }, []);
+  }, [initAudio]);
 
   const captureAndSendImage = async () => {
     if (frameInFlightRef.current) return;
@@ -452,30 +470,34 @@ export default function TaskDetailScreen() {
 
       const appendCaption = (text: string) => {
         const newWords = text.trim().split(/\s+/).filter(Boolean);
-        pendingWordsRef.current.push(...newWords);
+        // Reset — each transcription chunk replaces the previous caption
+        pendingWordsRef.current = newWords;
+        setCaptionText("");
 
         if (captionResetTimerRef.current) {
           clearTimeout(captionResetTimerRef.current);
           captionResetTimerRef.current = null;
         }
-
-        if (!wordRevealTimerRef.current) {
-          wordRevealTimerRef.current = setInterval(() => {
-            if (pendingWordsRef.current.length === 0) {
-              clearInterval(wordRevealTimerRef.current!);
-              wordRevealTimerRef.current = null;
-              captionResetTimerRef.current = setTimeout(() => {
-                captionResetTimerRef.current = null;
-                setCaptionText("");
-              }, 8000);
-              return;
-            }
-            const batch = pendingWordsRef.current.splice(0, 3);
-            setCaptionText((prev) =>
-              prev ? prev + " " + batch.join(" ") : batch.join(" "),
-            );
-          }, 150);
+        if (wordRevealTimerRef.current) {
+          clearInterval(wordRevealTimerRef.current);
+          wordRevealTimerRef.current = null;
         }
+
+        wordRevealTimerRef.current = setInterval(() => {
+          if (pendingWordsRef.current.length === 0) {
+            clearInterval(wordRevealTimerRef.current!);
+            wordRevealTimerRef.current = null;
+            captionResetTimerRef.current = setTimeout(() => {
+              captionResetTimerRef.current = null;
+              setCaptionText("");
+            }, 8000);
+            return;
+          }
+          const batch = pendingWordsRef.current.splice(0, 3);
+          setCaptionText((prev) =>
+            prev ? prev + " " + batch.join(" ") : batch.join(" "),
+          );
+        }, 150);
       };
 
       const stopAudio = () => {
@@ -511,11 +533,13 @@ export default function TaskDetailScreen() {
         if (doneRef.current) return;
         doneRef.current = true;
         stopImages();
+        // Play the ding BEFORE tearing down the audio context so iOS
+        // audio session is still active and in playback mode.
+        if (soundEffects) playDing();
         stopAudio();
         const w = wsRef.current;
         if (w && w.readyState !== WebSocket.CLOSED) w.close();
         setShowCompletion(true);
-        if (soundEffects) playDing();
         Animated.parallel([
           Animated.timing(overlayOpacity, {
             toValue: 1,
@@ -800,7 +824,6 @@ export default function TaskDetailScreen() {
             accessibilityLabel="Hold to speak"
             accessibilityRole="button"
           >
-            <Text style={{ fontSize: 18 }}>🎤</Text>
             <Text
               style={{
                 color: "#fff",
