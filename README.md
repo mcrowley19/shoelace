@@ -1,40 +1,98 @@
-# shoelace
+# Shoelace
 
-# shoelace
+Shoelace is an accessibility assistant mobile app built with React Native (Expo). It guides users through everyday tasks by capturing camera snapshots, sending them to Google's Gemini Live API, and returning step-by-step audio instructions in real time.
 
-Shoelase is an accessibility assistant app designed for mobile using React Native. It guides users through tasks by taking regular snapshots of the user's camera and uploading them to the Gemini API, then receiving an audio response guiding the user through the next step.
-
-## System architecture
+## System Architecture
 
 ![System architecture](sysDiagram.png)
 
 ### Frontend
 
-The frontend of shoelace is written in React Native. Once the user opens the app, they are given the option to select a task. Upon beginning a task, the user's camera opens. This is managed through the 'react-native-vision-camera' library which allows us to request camera permissions and then regularly take snapshots of the user's camera and send it to our backend. As the user completes tasks, they will be guided through the process through AI response audio which is sent from the backend. In addition, there is a press to talk feature in each session where the user can ask the AI questions related to the current task.
+**Stack:** React Native, Expo, Expo Router, TypeScript
 
-These audio responses are sent in the form of raw PCM data chunks and are converted into a playable format in useAudioSession.ts. This ensures lower latency than sending a full AI response from the backend. Once the user uses the press to speak function, the AI will stop all audio being played to ensure that the user does not get confused by past advice being played following their questions.
+The frontend is organized as a file-based routed Expo app:
 
-The core logic lives in three hooks that work together:
+```
+frontend/helper-app/
+├── app/                     # Expo Router pages
+│   ├── _layout.tsx          # Root layout (providers, splash screen)
+│   ├── (tabs)/              # Tab navigation
+│   │   ├── index.tsx        # Home — task carousel by category
+│   │   ├── completed.tsx    # Completed tasks list
+│   │   └── settings.tsx     # Sound effects & transcription toggles
+│   └── task/
+│       ├── setup/[id].tsx   # Pre-task instructions
+│       └── [id].tsx         # Active task session (camera + audio)
+├── components/              # TaskCamera, CompletionOverlay, etc.
+├── context/                 # React Context providers
+│   ├── tasks-context.tsx    # Global task state (add/update/toggle/delete)
+│   └── settings-context.tsx # User prefs, persisted via AsyncStorage
+├── data/tasks.ts            # Predefined task library with AI prompts
+├── constants/theme.ts       # Colors and fonts
+├── styles/                  # StyleSheet definitions
+└── utils/                   # Camera, audio, and asset helpers
+```
 
-useTaskSession.ts
+**User flow:** Home → select task → setup screen → start session (camera opens).
 
-- Opens a WebSocket to the backend
-- Captures camera frames every 1.5s and sends them as base64 JPEGs
-- Receives PCM audio and transcription chunks back
-- Triggers the CompletionOverlay when backend sends TASK_COMPLETE
+During a session, three hooks collaborate:
 
-useAudioSession.ts — audio playback
+- **useTaskSession** — opens a WebSocket to the backend, captures camera frames every 3 seconds as base64 JPEGs, receives PCM audio and transcription chunks, and triggers `CompletionOverlay` on `TASK_COMPLETE`.
+- **useAudioSession** — creates a 24 kHz `AudioContext`, decodes incoming PCM base64, queues chunks for playback, and blocks recording while audio is playing.
+- **useVoiceInput** — records press-and-hold audio at 16 kHz WAV, encodes to base64, and sends via the WebSocket. Drives the pulsing animation on the mic button.
 
-- Creates an AudioContext at 24kHz
-- Decodes incoming PCM base64 and queues it for playback
-- Blocks recording while audio is playing
+**State management:** React Context API (no external state library). `TasksContext` holds the task list in memory; `SettingsContext` persists preferences to AsyncStorage.
 
-useVoiceInput.ts — voice recording
-
-- Records press-and-hold audio at 16kHz WAV
-- Encodes to base64 and sends via the WebSocket
-- Drives the pulsing animation on MicButton
+**Key libraries:** react-native-vision-camera, react-native-audio-api, expo-av, react-native-reanimated, react-native-quick-base64.
 
 ### Backend
 
-The backend of shoelace is written in Python and utilises FastAPI to initialise web sockets between the frontend and the Gemini Live session.
+**Stack:** Python, FastAPI, Google Gemini Live API
+
+```
+backend/
+├── agent.py      # FastAPI app & WebSocket endpoint
+├── session.py    # Gemini Live session management
+├── pool.py       # Pre-warmed session pool (default 5 sessions)
+├── config.py     # System prompts and configuration
+├── utils.py      # Image resizing, audio helpers, WebSocket utilities
+├── Pipfile       # Python dependencies
+└── Dockerfile
+```
+
+The backend maintains a pool of pre-warmed Gemini Live sessions for instant connections. On each WebSocket connection:
+
+1. A pooled session is acquired.
+2. The task-specific AI prompt is injected on the first camera frame.
+3. Incoming JPEG frames are resized (max 1024 px, quality 80) and forwarded to Gemini.
+4. Gemini streams back PCM audio chunks (24 kHz, 16-bit mono) and transcription text.
+5. When the AI determines the task is complete, it sends a `TASK_COMPLETE` signal.
+
+### WebSocket Protocol
+
+| Direction | Type | Payload |
+|-----------|------|---------|
+| Client → Server | Image frame | Raw base64 JPEG |
+| Client → Server | Voice input | `{ type: "audio", data: "<base64 WAV>" }` |
+| Server → Client | Audio | Binary PCM chunks (24 kHz 16-bit mono) |
+| Server → Client | Transcription | `{ type: "transcription", text: "..." }` |
+| Server → Client | Ready | `{ type: "ready" }` — request next frame |
+| Server → Client | Complete | `{ type: "TASK_COMPLETE" }` |
+
+## Running the App
+
+### Backend
+
+```bash
+cd backend
+pipenv install
+pipenv run uvicorn agent:app --host 0.0.0.0 --port 8000
+```
+
+### Frontend
+
+```bash
+cd frontend/helper-app
+npm install
+npx expo start
+```
