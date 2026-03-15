@@ -70,14 +70,14 @@ The backend maintains a pool of pre-warmed Gemini Live sessions for instant conn
 
 ### WebSocket Protocol
 
-| Direction | Type | Payload |
-|-----------|------|---------|
-| Client → Server | Image frame | Raw base64 JPEG |
-| Client → Server | Voice input | `{ type: "audio", data: "<base64 WAV>" }` |
-| Server → Client | Audio | Binary PCM chunks (24 kHz 16-bit mono) |
-| Server → Client | Transcription | `{ type: "transcription", text: "..." }` |
-| Server → Client | Ready | `{ type: "ready" }` — request next frame |
-| Server → Client | Complete | `{ type: "TASK_COMPLETE" }` |
+| Direction       | Type          | Payload                                   |
+| --------------- | ------------- | ----------------------------------------- |
+| Client → Server | Image frame   | Raw base64 JPEG                           |
+| Client → Server | Voice input   | `{ type: "audio", data: "<base64 WAV>" }` |
+| Server → Client | Audio         | Binary PCM chunks (24 kHz 16-bit mono)    |
+| Server → Client | Transcription | `{ type: "transcription", text: "..." }`  |
+| Server → Client | Ready         | `{ type: "ready" }` — request next frame  |
+| Server → Client | Complete      | `{ type: "TASK_COMPLETE" }`               |
 
 ## Running the App
 
