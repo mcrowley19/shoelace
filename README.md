@@ -1,14 +1,16 @@
 # Shoelace
 
-Shoelace is an accessibility assistant mobile app built with React Native (Expo). It guides users through everyday tasks by capturing camera snapshots, sending them to Google's Gemini Live API, and returning step-by-step audio instructions in real time.
+Shoelace is an accessibility assistant android app built with React Native (Expo). It guides users through everyday tasks by capturing camera snapshots, sending them to Google's Gemini Live API, and returning step-by-step audio instructions in real time.
 
 ![Logo](shoelace.png)
 
 ## Running the App
 
-Due to the use of non-expo packages, the app cannot be tested using the traditional method of cloning the repo and using the Expo Go CLI
+Due to the use of non-expo packages, you must build the app locally on an android device. A tutorial on how to do this can be found here:
+https://docs.expo.dev/guides/local-app-development/
 
-A pre-built apk of the app is available on:
+
+Alternatively, a pre-built apk of the app is available on:
 https://expo.dev/accounts/mcrowley19/projects/helper-app/builds/b91b46c7-0ae4-4344-9e5e-fcd11edf90f2
 
 ## System Architecture
