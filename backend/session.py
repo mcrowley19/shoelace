@@ -4,6 +4,7 @@ import json
 
 from fastapi import WebSocket, WebSocketDisconnect
 from google.genai.types import Content, Part
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
 from config import logger
 from pool import session_pool
@@ -217,6 +218,11 @@ async def _process_frame(
         done.set()
         raise
 
+    except (ConnectionClosedOK, ConnectionClosedError) as e:
+        print(f"ln_pf: Gemini connection closed: {e}", flush=True)
+        done.set()
+        return False, last_transcription
+
     except Exception as e:
         if not _is_connected():
             print(f"ln_pf: ignoring error on dead socket: {e}", flush=True)
@@ -267,6 +273,10 @@ async def _process_audio_input(
         return False, transcription
     except WebSocketDisconnect:
         raise
+    except (ConnectionClosedOK, ConnectionClosedError) as e:
+        print(f"ln_pai: Gemini connection closed: {e}", flush=True)
+        done.set()
+        return False, ""
     except Exception as e:
         print(f"ln_pai: audio input error: {e}", flush=True)
         logger.exception(f"Audio input error: {e}")
@@ -331,7 +341,7 @@ async def _run_session(websocket: WebSocket, task_prompt: str, captions: bool = 
         await _send_error(websocket, "Failed to connect to AI")
         return
 
-    session, _ = pair
+    session, _, _ = pair
     print("ln_rs: session ready", flush=True)
 
     try:

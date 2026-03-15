@@ -31,7 +31,9 @@ function LoadingScreen({ onDone }: { onDone: () => void }) {
   const animatedStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
 
   return (
-    <Animated.View style={[StyleSheet.absoluteFill, styles.loading, animatedStyle]}>
+    <Animated.View
+      style={[StyleSheet.absoluteFill, styles.loading, animatedStyle]}
+    >
       <Image
         source={require("@/assets/images/shoelace.png")}
         style={styles.loadingImage}

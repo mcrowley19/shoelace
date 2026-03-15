@@ -9,7 +9,8 @@ export const TASK_COVER_IMAGES: Record<string, any> = {
   "Search on Google": require("@/assets/images/task-covers/google.png"),
   "Open Facebook": require("@/assets/images/task-covers/open_facebook.png"),
   "Make tea": require("@/assets/images/task-covers/tea.png"),
-  "Make a bed": require("@/assets/images/task-covers/bed.png"),
+  "Brush your teeth": require("../assets/images/task-covers/toothpaste.png"),
+  "Put in contacts": require("../assets/images/task-covers/contact.png"),
 };
 
 export const TASK_GUIDE_IMAGES: Record<string, any> = {
@@ -18,10 +19,10 @@ export const TASK_GUIDE_IMAGES: Record<string, any> = {
   "Fold trousers": require("@/assets/images/guides/trousers_guide.png"),
   "Tie shoelaces": require("@/assets/images/guides/tie_shoes_guide.png"),
   "Make tea": require("@/assets/images/guides/tea_guide.png"),
-  "Make a bed": require("@/assets/images/guides/make_bed_guide.png"),
   "Open Facebook": require("@/assets/images/guides/computer_guide.png"),
   "Send an email": require("@/assets/images/guides/computer_guide.png"),
   "Search on Google": require("@/assets/images/guides/computer_guide.png"),
+  "Put in contacts": require("../assets/images/guides/contacts_guide.png"),
 };
 
 export const CATEGORY_PLACEHOLDER_COLOR: Record<string, string> = {
